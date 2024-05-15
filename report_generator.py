@@ -75,7 +75,7 @@ def get_or_refresh_token(retries=3):
     if token_info['access_token'] and (current_time - token_info['acquired_at']) < token_info['expires_in']:
         return token_info['access_token']
     else:
-        print("Requesting new OAuth token...")
+        # print("Requesting new OAuth token...")
         # Encode client_id and client_secret in Base64
         credentials = f"{client_id}:{client_secret}"
         encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
@@ -94,7 +94,7 @@ def get_or_refresh_token(retries=3):
                     'expires_in': token_data.get('expires_in', 300) - 60,  # Increased buffer
                     'acquired_at': current_time
                 }
-                print("New OAuth token acquired.")
+                # print("New OAuth token acquired.")
                 return token_info['access_token']
             else:
                 print(f"Attempt {attempt + 1} failed to get OAuth token: {response.status_code} {response.text}")
@@ -226,7 +226,7 @@ def flatten_rendition_data(rendition_data):
         flattened_data[new_key] = value
     return flattened_data
 
-def fetch_rendition_details(account_id, access_token, video_ids, delay=1):
+def fetch_rendition_details(account_id, access_token, video_ids, delay=0.25):
     renditions_info = []
     with tqdm(total=len(video_ids), desc="Fetching Rendition Details", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii = ascii) as pbar:
         for video_id in video_ids:
@@ -259,7 +259,7 @@ def main():
         # print(f'CSV file updated: {csv_path}')
         video_ids = read_video_ids_from_csv(csv_path)
         # print(video_ids)
-        fetch_rendition_details(account_id, access_token, video_ids, delay=1)
+        fetch_rendition_details(account_id, access_token, video_ids, delay=0.25)
 
 if __name__ == "__main__":
     main()
