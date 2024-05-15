@@ -67,7 +67,7 @@ ascii = "┄─━"
 token_info = {'access_token': None, 'expires_in': None, 'acquired_at': None}
 
 # Function to get or refresh the OAuth token with Base64 encoding
-def get_or_refresh_token():
+def get_or_refresh_token(retries=3):
     global token_info
     current_time = time.time()
     
@@ -85,20 +85,23 @@ def get_or_refresh_token():
             'Authorization': f'Basic {encoded_credentials}'
         }
         
-        response = requests.post(oauth_url, headers=headers, data='grant_type=client_credentials')
-        
-        if response.status_code == 200:
-            token_data = response.json()
-            token_info = {
-                'access_token': token_data['access_token'],
-                'expires_in': token_data.get('expires_in', 300) - 30,  # Subtract a buffer
-                'acquired_at': current_time
-            }
-            print("New OAuth token acquired.")
-            return token_info['access_token']
-        else:
-            print("Failed to get OAuth token:", response.text)
-            return None
+        for attempt in range(retries):
+            response = requests.post(oauth_url, headers=headers, data='grant_type=client_credentials')
+            if response.status_code == 200:
+                token_data = response.json()
+                token_info = {
+                    'access_token': token_data['access_token'],
+                    'expires_in': token_data.get('expires_in', 300) - 60,  # Increased buffer
+                    'acquired_at': current_time
+                }
+                print("New OAuth token acquired.")
+                return token_info['access_token']
+            else:
+                print(f"Attempt {attempt + 1} failed to get OAuth token: {response.status_code} {response.text}")
+                time.sleep(2)  # Wait before retrying
+
+        print("Failed to acquire new token after retries.")
+        return None
 
 def get_video_count(account_id, access_token):
     url = cms_api_video_count_template.format(account_id)
@@ -225,23 +228,25 @@ def flatten_rendition_data(rendition_data):
 
 def fetch_rendition_details(account_id, access_token, video_ids, delay=1):
     renditions_info = []
-    headers = {'Authorization': f'Bearer {access_token}'}
+    with tqdm(total=len(video_ids), desc="Fetching Rendition Details", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii = ascii) as pbar:
+        for video_id in video_ids:
+            access_token = get_or_refresh_token()  # Refresh token as needed
+            headers = {'Authorization': f'Bearer {access_token}'}
 
-    for video_id in video_ids:
-        url = cms_api_dr_template.format(account_id, video_id)
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            renditions_info.append(data)
-            for rendition in data:
-                flattened_rendition = flatten_rendition_data(rendition)
-                renditions_info.append(flattened_rendition)
-                print(flattened_rendition)
-        else:
-            print(f"Failed to fetch rendition data for video ID {video_id}: {response.status_code}")
-            print(response.text)
-        time.sleep(delay)  # Sleep to respect API rate limits
-        # update_csv_with_new_data(csv_path, flatten_rendition_data)
+            url = cms_api_dr_template.format(account_id, video_id)
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                renditions_info.append(data)
+                for rendition in data:
+                    flattened_rendition = flatten_rendition_data(rendition)
+                    renditions_info.append(flattened_rendition)
+                    # print(flattened_rendition)  # Corrected to print the entire dictionary
+            else:
+                print(f"Failed to fetch rendition data for video ID {video_id}: {response.status_code}")
+                print(response.text)  # This prints the API error message
+            time.sleep(delay)  # Confirm delay is an integer; this ensures API rate limits are respected
+            pbar.update(1)
     return renditions_info
 
 def main():
@@ -251,10 +256,10 @@ def main():
         csv_path = os.path.join(csv_dir, account_id, csv_file)
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         fetch_and_write_videos(account_id, access_token, csv_path, fields_to_ignore)
-        print(f'CSV file updated: {csv_path}')
+        # print(f'CSV file updated: {csv_path}')
         video_ids = read_video_ids_from_csv(csv_path)
-        print(video_ids)
-        renditions = fetch_rendition_details(account_id, access_token, video_ids)
+        # print(video_ids)
+        fetch_rendition_details(account_id, access_token, video_ids, delay=1)
 
 if __name__ == "__main__":
     main()
