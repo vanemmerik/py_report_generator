@@ -1,15 +1,12 @@
 import csv
 import os
 import requests
-import json
 import time
 import base64
-import subprocess
-import re
-import pandas as pd
 from dotenv import load_dotenv
 from tqdm import tqdm
 from datetime import datetime
+from colorama import Fore
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,22 +28,8 @@ failure_log_dir = os.getenv('LOG_PATH')
 # Last processed id file path based on .env file
 last_processed_id_path = os.getenv('LAST_PROCESSED_PATH')
 
-# ANSI escape codes for colors
-colors = {
-    "red": "\033[91m",
-    "green": "\033[92m",
-    "end": "\033[0m"
-}
-
-def get_color(progress, total):
-    """Return color based on progress."""
-    percentage = progress / total
-    if percentage < 0.33:
-        return colors['red']
-    elif percentage < 0.66:
-        return colors['amber']
-    else:
-        return colors['green']
+#ascii = "⣀⣄⣤⣦⣶⣷⣿"
+ascii = "┄─━"
 
 # Brightcove OAuth URL
 oauth_url = 'https://oauth.brightcove.com/v4/access_token'
@@ -88,12 +71,11 @@ def get_or_refresh_token():
     global token_info
     current_time = time.time()
     
-    # Check if the token is still valid
-    if token_info['access_token'] and (current_time - token_info['acquired_at']) < token_info['expires_in']:
+    if token_info.get('access_token') and (current_time - token_info.get('acquired_at', 0)) < token_info.get('expires_in', 0):
+        # print("Token still valid, using existing token.")
         return token_info['access_token']
     else:
-        print("Requesting new OAuth token...")
-        # Encode client_id and client_secret in Base64
+        print("Requesting new OAuth token or existing token expired...")
         credentials = f"{client_id}:{client_secret}"
         encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
         
@@ -108,13 +90,13 @@ def get_or_refresh_token():
             token_data = response.json()
             token_info = {
                 'access_token': token_data['access_token'],
-                'expires_in': token_data.get('expires_in', 300) - 30,  # Subtract a buffer
+                'expires_in': token_data.get('expires_in', 300) - 30,  # Buffer
                 'acquired_at': current_time
             }
-            print("New OAuth token acquired.")
+            print("New OAuth token acquired successfully.")
             return token_info['access_token']
         else:
-            print("Failed to get OAuth token:", response.text)
+            print("Failed to get OAuth token:", response.status_code, response.text)
             return None
 
 def get_video_count(account_id, access_token):
@@ -131,21 +113,24 @@ def get_video_count(account_id, access_token):
         print(response.text)
         return None
 
-def fetch_and_write_videos(account_id, access_token, csv_path, fields_to_ignore):
+def fetch_and_write_videos(account_id, get_token, csv_path, fields_to_ignore):
     limit = 60
     offset = 0
+    access_token = get_token()
     total_videos = get_video_count(account_id, access_token)
-    # Open the file outside the loop and manage it within the loop
+    
     with open(csv_path, mode='w', newline='') as file:
         writer = None
-        with tqdm(total=total_videos, desc="Fetching Videos", bar_format=f"{colors['green']}{{l_bar}}{colors['red']}{{bar}}{colors['end']}{colors['green']}{{r_bar}}{colors['end']}", ascii = "⣀⣄⣤⣦⣶⣷⣿") as pbar: 
-            while True:
+        with tqdm(total=total_videos, desc="Fetching Videos", 
+                  bar_format=f"{Fore.CYAN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.LIGHTGREEN_EX}{{r_bar}}{Fore.RESET}", ascii = ascii) as pbar: 
+            while total_videos > 0:
+                access_token = get_token()  # Refresh token for each cycle
                 url = cms_api_video_info_template.format(account_id, limit, offset)
                 headers = {'Authorization': f'Bearer {access_token}'}
                 response = requests.get(url, headers=headers)
                 if response.status_code == 200:
                     video_data = response.json()
-                    if not writer:  # Initialize CSV DictWriter after fetching the first page
+                    if not writer:
                         fieldnames = [key for key in video_data[0].keys() if key not in fields_to_ignore]
                         writer = csv.DictWriter(file, fieldnames=fieldnames)
                         writer.writeheader()
@@ -153,15 +138,12 @@ def fetch_and_write_videos(account_id, access_token, csv_path, fields_to_ignore)
                     for video in video_data:
                         filtered_video = {k: v for k, v in video.items() if k in fieldnames}
                         writer.writerow(filtered_video)
-
                     pbar.update(len(video_data))
-                    if len(video_data) < limit:
-                        break  # Exit loop when last page is processed
                     offset += limit
                 else:
                     print(f"Failed to get video info: {response.status_code}")
-                    print(response.text)
                     break
+
 
 def write_to_csv(csv_path, video_data, fields_to_ignore):
     # Create directory if it doesn't exist
@@ -181,37 +163,6 @@ def write_to_csv(csv_path, video_data, fields_to_ignore):
             # Filter out ignored fields from the video dictionary
             filtered_video = {k: v for k, v in video.items() if k in headers}
             writer.writerow(filtered_video)
-
-# def update_csv_with_new_data(csv_path, new_data):
-#     # Read existing data into a list of dictionaries
-#     if os.path.exists(csv_path):
-#         with open(csv_path, mode='r', newline='') as file:
-#             reader = csv.DictReader(file)
-#             existing_data = list(reader)
-#             existing_fields = reader.fieldnames
-#     else:
-#         existing_data = []
-#         existing_fields = set()
-
-#     # Update existing data with new data
-#     video_id_index = {video['video_id']: video for video in existing_data}
-#     for data in new_data:
-#         video_id = data['video_id']
-#         if video_id in video_id_index:
-#             # Update existing row
-#             video_id_index[video_id].update(data)
-#         else:
-#             # Add new row
-#             existing_data.append(data)
-#         # Update the fieldnames
-#         existing_fields.update(data.keys())
-
-#     # Write updated data back to CSV
-#     with open(csv_path, mode='w', newline='') as file:
-#         writer = csv.DictWriter(file, fieldnames=existing_fields)
-#         writer.writeheader()
-#         for row in existing_data:
-#             writer.writerow(row)
 
 def read_video_ids_from_csv(csv_path):
     video_ids = []
@@ -238,40 +189,41 @@ def flatten_rendition_data(rendition_data):
             continue
         new_key = f"{rendition_id}_{key}"
         flattened_data[new_key] = value
+        print(flattened_data)
     return flattened_data
 
-def fetch_rendition_details(account_id, access_token, video_ids, delay=1):
+def fetch_rendition_details(account_id, get_token, video_ids, delay=1):
     renditions_info = []
-    headers = {'Authorization': f'Bearer {access_token}'}
-
     for video_id in video_ids:
+        access_token = get_token()  # Get fresh token for each request
+        headers = {'Authorization': f'Bearer {access_token}'}
         url = cms_api_dr_template.format(account_id, video_id)
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
             data = response.json()
-            renditions_info.append(data)
             for rendition in data:
                 flattened_rendition = flatten_rendition_data(rendition)
-                renditions_info.append(flattened_rendition)
                 print(flattened_rendition)
+                renditions_info.append(flattened_rendition)
         else:
             print(f"Failed to fetch rendition data for video ID {video_id}: {response.status_code}")
             print(response.text)
-        time.sleep(delay)  # Sleep to respect API rate limits
-        # update_csv_with_new_data(csv_path, flatten_rendition_data)
+        time.sleep(delay)
     return renditions_info
 
 def main():
-    access_token = get_or_refresh_token()
-    if access_token:
-        csv_file = f'{account_id}_{current_time}.csv'
-        csv_path = os.path.join(csv_dir, account_id, csv_file)
-        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-        fetch_and_write_videos(account_id, access_token, csv_path, fields_to_ignore)
-        print(f'CSV file updated: {csv_path}')
-        video_ids = read_video_ids_from_csv(csv_path)
-        print(video_ids)
-        renditions = fetch_rendition_details(account_id, access_token, video_ids)
+    # Do not fetch token here, pass the function instead
+    csv_file = f'{account_id}_{current_time}.csv'
+    csv_path = os.path.join(csv_dir, account_id, csv_file)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    # Pass the token function, not the token itself
+    fetch_and_write_videos(account_id, get_or_refresh_token, csv_path, fields_to_ignore)
+    print(f'CSV file updated: {csv_path}')
+
+    video_ids = read_video_ids_from_csv(csv_path)
+    renditions = fetch_rendition_details(account_id, get_or_refresh_token, video_ids)
+    print(renditions)
 
 if __name__ == "__main__":
     main()
