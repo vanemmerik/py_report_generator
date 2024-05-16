@@ -226,13 +226,12 @@ def flatten_rendition_data(rendition_data):
         flattened_data[new_key] = value
     return flattened_data
 
-def fetch_rendition_details(account_id, access_token, video_ids, delay=0.25):
+def fetch_rendition_details(account_id, access_token, video_ids, delay=0.1):
     renditions_info = []
     with tqdm(total=len(video_ids), desc="Fetching Rendition Details", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii = ascii) as pbar:
         for video_id in video_ids:
             access_token = get_or_refresh_token()  # Refresh token as needed
             headers = {'Authorization': f'Bearer {access_token}'}
-
             url = cms_api_dr_template.format(account_id, video_id)
             response = requests.get(url, headers=headers)
             if response.status_code == 200:
@@ -241,7 +240,7 @@ def fetch_rendition_details(account_id, access_token, video_ids, delay=0.25):
                 for rendition in data:
                     flattened_rendition = flatten_rendition_data(rendition)
                     renditions_info.append(flattened_rendition)
-                    # print(flattened_rendition)  # Corrected to print the entire dictionary
+                    print(flattened_rendition)
             else:
                 print(f"Failed to fetch rendition data for video ID {video_id}: {response.status_code}")
                 print(response.text)  # This prints the API error message
@@ -259,7 +258,7 @@ def main():
         # print(f'CSV file updated: {csv_path}')
         video_ids = read_video_ids_from_csv(csv_path)
         # print(video_ids)
-        fetch_rendition_details(account_id, access_token, video_ids, delay=0.25)
+        fetch_rendition_details(account_id, access_token, video_ids, delay=0.1)
 
 if __name__ == "__main__":
     main()
