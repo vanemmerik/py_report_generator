@@ -1,6 +1,8 @@
 import csv
+import re
 import os
 import requests
+import json
 import time
 import base64
 from dotenv import load_dotenv
@@ -35,15 +37,17 @@ oauth_url = 'https://oauth.brightcove.com/v4/access_token'
 cms_api_video_count_template = 'https://cms.api.brightcove.com/v1/accounts/{}/counts/videos'
 cms_api_video_info_template = 'https://cms.api.brightcove.com/v1/accounts/{}/videos?limit={}&offset={}'
 cms_api_dr_template = 'https://cms.api.brightcove.com/v1/accounts/{}/videos/{}/assets/dynamic_renditions'
+cms_api_master_info = 'https://cms.api.brightcove.com/v1/accounts/{}/videos/{}/digital_master'
 
 fields_to_ignore = {
-    'account_id', 
+    'account_id',
+    'digital_master_id',
     'clip_source_video_id', 
     'created_by', 
     'cue_points', 
     'custom_fields', 
     'description', 
-    'folder_id', 
+    'folder_id',
     'images', 
     'link', 
     'long_description', 
@@ -59,6 +63,12 @@ fields_to_ignore = {
     'playback_rights_id', 
     'labels'
     }
+
+master_keys_to_ignore = {
+    'id',
+    'created_at',
+    'updated_at'
+}
 
 # ascii = "⣀⣄⣤⣦⣶⣷⣿"
 ascii = "┄─━"
@@ -151,10 +161,10 @@ def fetch_and_write_videos(account_id, access_token, csv_path, fields_to_ignore)
 
 def write_to_csv(csv_path, video_data, fields_to_ignore):
     # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)  
     # Collect headers from all video items, excluding ignored fields
     headers = set()
+
     for video in video_data:
         headers.update(video.keys())
     headers = [h for h in headers if h not in fields_to_ignore]
@@ -168,36 +178,74 @@ def write_to_csv(csv_path, video_data, fields_to_ignore):
             filtered_video = {k: v for k, v in video.items() if k in headers}
             writer.writerow(filtered_video)
 
-# def update_csv_with_new_data(csv_path, new_data):
-#     # Read existing data into a list of dictionaries
-#     if os.path.exists(csv_path):
-#         with open(csv_path, mode='r', newline='') as file:
-#             reader = csv.DictReader(file)
-#             existing_data = list(reader)
-#             existing_fields = reader.fieldnames
-#     else:
-#         existing_data = []
-#         existing_fields = set()
+def update_csv_with_json(csv_path, video_id, flattened_renditions):
+    with open(csv_path, mode='r', newline='') as csv_file:
+        reader = csv.DictReader(csv_file)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+    row_to_update = None
+    for row in rows:
+        if row['id'] == video_id:
+            row_to_update = row
+            break
+    if row_to_update is None:
+        print(f"Video ID {video_id} not found in the CSV.")
+        return
+    if isinstance(flattened_renditions, str):
+        import json
+        flattened_renditions = json.loads(flattened_renditions)
+    if not isinstance(flattened_renditions, list):
+        print("flattened_renditions should be a list.")
+        return
+    for rendition in flattened_renditions:
+        if not isinstance(rendition, dict):
+            print(f"Expected dict but got {type(rendition)}")
+            continue
+        for key, value in rendition.items():
+            row_to_update[key] = value
+            if key not in fieldnames:
+                fieldnames.append(key)
+    # Write the updated rows back to the CSV
+    with open(csv_path, mode='w', newline='') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
-#     # Update existing data with new data
-#     video_id_index = {video['video_id']: video for video in existing_data}
-#     for data in new_data:
-#         video_id = data['video_id']
-#         if video_id in video_id_index:
-#             # Update existing row
-#             video_id_index[video_id].update(data)
-#         else:
-#             # Add new row
-#             existing_data.append(data)
-#         # Update the fieldnames
-#         existing_fields.update(data.keys())
+def csv_master_info(csv_path, video_id, data):
+    # Read the existing CSV into a list of dictionaries
+    with open(csv_path, mode='r', newline='') as csv_file:
+        reader = csv.DictReader(csv_file)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
 
-#     # Write updated data back to CSV
-#     with open(csv_path, mode='w', newline='') as file:
-#         writer = csv.DictWriter(file, fieldnames=existing_fields)
-#         writer.writeheader()
-#         for row in existing_data:
-#             writer.writerow(row)
+    # Find the row corresponding to the given video_id
+    row_index = None
+    for i, row in enumerate(rows):
+        if row['id'] == video_id:
+            row_index = i
+            break
+
+    if row_index is None:
+        print(f"Video ID {video_id} not found in the CSV.")
+        return
+
+    # Prepare the new data to be inserted, filtering out ignored keys and prefixing with 'master_'
+    new_data = {f"master_{key}": value for key, value in data.items() if key not in master_keys_to_ignore}
+
+    # Update fieldnames to include new data keys
+    for new_key in new_data.keys():
+        if new_key not in fieldnames:
+            fieldnames.insert(4, new_key)
+
+    # Insert new data into the corresponding row
+    for new_key, new_value in new_data.items():
+        rows[row_index][new_key] = new_value
+
+    # Write the updated rows back to the CSV
+    with open(csv_path, mode='w', newline='') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 def read_video_ids_from_csv(csv_path):
     video_ids = []
@@ -226,27 +274,57 @@ def flatten_rendition_data(rendition_data):
         flattened_data[new_key] = value
     return flattened_data
 
-def fetch_rendition_details(account_id, access_token, video_ids, delay=0.1):
+def fetch_rendition_details(csv_path, account_id, access_token, video_ids):
+    delay = 0.25
     renditions_info = []
     with tqdm(total=len(video_ids), desc="Fetching Rendition Details", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii = ascii) as pbar:
         for video_id in video_ids:
             access_token = get_or_refresh_token()  # Refresh token as needed
             headers = {'Authorization': f'Bearer {access_token}'}
             url = cms_api_dr_template.format(account_id, video_id)
+            master_url = cms_api_master_info.format(account_id, video_id)
+            master_response = requests.get(master_url, headers=headers)
             response = requests.get(url, headers=headers)
+            if master_response.status_code == 200:
+                master_data = master_response.json()                
+                csv_master_info(csv_path, video_id, master_data)
             if response.status_code == 200:
                 data = response.json()
                 renditions_info.append(data)
-                for rendition in data:
-                    flattened_rendition = flatten_rendition_data(rendition)
-                    renditions_info.append(flattened_rendition)
-                    print(flattened_rendition)
+                flattened_rendition = json.dumps([flatten_rendition_data(rendition) for rendition in data])
+                update_csv_with_json(csv_path, video_id, flattened_rendition)
             else:
                 print(f"Failed to fetch rendition data for video ID {video_id}: {response.status_code}")
                 print(response.text)  # This prints the API error message
             time.sleep(delay)  # Confirm delay is an integer; this ensures API rate limits are respected
             pbar.update(1)
-    return renditions_info
+    return flattened_rendition
+
+def reorder_csv(csv_path):
+    with open(csv_path, mode='r', newline='') as csv_file:
+        reader = csv.DictReader(csv_file)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+
+    # Separate audio columns and other columns
+    audio_columns = [col for col in fieldnames if col.startswith('audio')]
+    other_columns = [col for col in fieldnames if not col.startswith('audio')]
+
+    # Sort audio columns numerically
+    def sort_audio_columns(col):
+        match = re.match(r'audio(\d+)_', col)
+        return int(match.group(1)) if match else float('inf')
+
+    audio_columns.sort(key=sort_audio_columns)
+
+    # Define the new column order with audio columns at the end
+    new_fieldnames = other_columns + audio_columns
+
+    # Write the reordered columns back to the same CSV
+    with open(csv_path, mode='w', newline='') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=new_fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 def main():
     access_token = get_or_refresh_token()
@@ -255,10 +333,10 @@ def main():
         csv_path = os.path.join(csv_dir, account_id, csv_file)
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         fetch_and_write_videos(account_id, access_token, csv_path, fields_to_ignore)
-        # print(f'CSV file updated: {csv_path}')
         video_ids = read_video_ids_from_csv(csv_path)
-        # print(video_ids)
-        fetch_rendition_details(account_id, access_token, video_ids, delay=0.1)
-
+        fetch_rendition_details(csv_path, account_id, access_token, video_ids)
+        print(f'CSV file updated. Updating CSV order')
+        reorder_csv(csv_path)
+        print(f'Job done: {csv_path}')
 if __name__ == "__main__":
     main()
