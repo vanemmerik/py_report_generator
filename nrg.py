@@ -1,3 +1,4 @@
+import sys
 import csv
 import base64
 import time
@@ -11,7 +12,7 @@ import ssl
 import certifi
 import tracemalloc
 from tqdm.asyncio import tqdm
-from colorama import Fore
+from colorama import Fore, Style, init
 from datetime import datetime
 from dotenv import load_dotenv
 import json
@@ -58,7 +59,8 @@ master_keys_to_ignore = {
     'id', 'created_at', 'updated_at'
 }
 
-ascii = "┄─━"
+ascii = "⣀⣄⣤⣦⣶⣷⣿"
+# ascii = "┄─━"
 
 # Global variable to store the access token and expiry time
 token_info = {'access_token': None, 'expires_in': None, 'acquired_at': None}
@@ -89,7 +91,7 @@ def get_or_refresh_token():
                 'expires_in': token_data.get('expires_in', 300) - 60,  # 1 minute buffer
                 'acquired_at': current_time
             }
-            logging.info('New OAuth token acquired.')
+            # logging.info('New OAuth token acquired.')
             return token_info['access_token']
         else:
             logging.error(f"Failed to acquire token: {response.status_code} {response.text}")
@@ -116,10 +118,12 @@ async def fetch_video_data(session, url, headers, ssl_context):
             logging.error(await response.text())
             return None
 
-async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore):
+async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore, created_files, max_videos=None):
     limit = 60
     offset = 0
     total_videos = get_video_count(account_id, access_token)
+    if max_videos:
+        total_videos = min(total_videos, max_videos)  # Use the minimum of total videos and max_videos
     headers = {'Authorization': f'Bearer {access_token}'}
     ssl_context = ssl.create_default_context(cafile=certifi.where())
 
@@ -137,8 +141,9 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
         file_index = 1
         row_count = 0
         csv_path = os.path.join(account_csv_dir, f'{account_id}_{current_time}_{file_index}.csv')
+        created_files.append(csv_path)  # Track created CSV files
 
-        with tqdm(total=total_videos, desc="Fetching Videos", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii=ascii) as pbar:
+        with tqdm(total=total_videos, desc=f"{Style.BRIGHT}Fetching Videos{Style.RESET_ALL}", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii=ascii) as pbar:
             for task in asyncio.as_completed(tasks):
                 video_data = await task
                 if video_data:
@@ -158,6 +163,7 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
                             file.close()
                             file_index += 1
                             csv_path = os.path.join(account_csv_dir, f'{account_id}_{current_time}_{file_index}.csv')
+                            created_files.append(csv_path)  # Track created CSV files
                             file = open(csv_path, mode='w', newline='')
                             writer = csv.DictWriter(file, fieldnames=fieldnames)
                             writer.writeheader()
@@ -166,7 +172,11 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
                         filtered_video = {k: v for k, v in video.items() if k in fieldnames}
                         writer.writerow(filtered_video)
                         row_count += 1
-                    pbar.update(len(video_data))
+                        pbar.update(1)
+                        if max_videos and row_count >= max_videos:
+                            break  # Stop processing once the max_videos limit is reached
+                if max_videos and row_count >= max_videos:
+                    break  # Stop processing once the max_videos limit is reached
 
             # Ensure the last file is closed
             if row_count > 0:
@@ -307,7 +317,7 @@ async def fetch_rendition_details(csv_path, account_id, video_ids, failure_log_p
 
     async with aiohttp.ClientSession() as session:
         tasks = []
-        with open(failure_log_path, mode='a') as failure_log, tqdm(total=len(video_ids), desc="Fetching Rendition Details", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii=ascii) as pbar:
+        with open(failure_log_path, mode='a') as failure_log, tqdm(total=len(video_ids), desc=f"{Style.BRIGHT}Fetching Rendition Details{Style.RESET_ALL}", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii=ascii) as pbar:
             for video_id in video_ids:
                 tasks.append(fetch_and_process(session, video_id, pbar, failure_log))
                 if len(tasks) % 10 == 0:
@@ -341,8 +351,9 @@ def reorder_csv(csv_path):
         writer.writeheader()
         writer.writerows(rows)
 
-async def main():
+async def main(max_videos=None):
     global token_info
+    created_files = []
 
     access_token = get_or_refresh_token()
     if access_token:
@@ -351,20 +362,23 @@ async def main():
         failure_log_file = f'{account_id}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
         failure_log_path = os.path.join(failure_log_dir, failure_log_file)
         os.makedirs(failure_log_dir, exist_ok=True)
-        await fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore)
+        await fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore, created_files, max_videos)
         
-        csv_files = sorted([f for f in os.listdir(account_csv_dir) if f.endswith('.csv')])
-        for csv_file in csv_files:
+        for csv_file in created_files:
             csv_path = os.path.join(account_csv_dir, csv_file)
             video_ids = read_video_ids_from_csv(csv_path)
             _, error_count = await fetch_rendition_details(csv_path, account_id, video_ids, failure_log_path)
             logging.info(f'CSV file {csv_file} updated. Updating CSV order')
             reorder_csv(csv_path)
-            logging.info(f'Job done: {csv_path}')
-            logging.info(f'Total errors encountered: {error_count}')
+            logging.info(f'Total errors encountered:{Fore.RED} {error_count}{Fore.RESET}')
+
+    logging.info(f'{Style.BRIGHT}Job done. You can find the csv in the following location:{Style.RESET_ALL} {Fore.CYAN}{csv_path}{Fore.RESET}')
+    sys.exit(0)  # Terminate the script after processing
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    max_videos = 50  # Set your limit here or None to process all videos
+    asyncio.run(main(max_videos))
 
 # snapshot = tracemalloc.take_snapshot()
 # top_stats = snapshot.statistics('lineno')
