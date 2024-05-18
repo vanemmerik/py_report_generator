@@ -26,6 +26,9 @@ tracemalloc.start()
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Initialize colorama
+init(autoreset=True)
+
 # Brightcove API Credentials stored in .env
 account_id = os.getenv('PUB_ID')
 client_id = os.getenv('CLIENT_ID')
@@ -59,8 +62,12 @@ master_keys_to_ignore = {
     'id', 'created_at', 'updated_at'
 }
 
-ascii = "⣀⣄⣤⣦⣶⣷⣿"
-# ascii = "┄─━"
+# Uncomment the progress bar style you would like to use
+# ascii = "⣀⣄⣤⣦⣶⣷⣿"
+# ascii = "─┄┈┉┅━"
+ascii = "▁▂▃▄▅▆▇█"
+# ascii = "░▏▎▍▌▋▊▉█"
+# ascii = "░▒▓█"
 
 # Global variable to store the access token and expiry time
 token_info = {'access_token': None, 'expires_in': None, 'acquired_at': None}
@@ -119,7 +126,7 @@ async def fetch_video_data(session, url, headers, ssl_context):
             return None
 
 async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore, created_files, max_videos=None):
-    limit = 60
+    limit = 80
     offset = 0
     total_videos = get_video_count(account_id, access_token)
     if max_videos:
@@ -134,9 +141,10 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
     async with aiohttp.ClientSession() as session:
         tasks = []
         while offset < total_videos:
-            url = cms_api_video_info_template.format(account_id, limit, offset)
+            batch_size = min(limit, total_videos - offset)  # Adjust the batch size to not exceed total_videos
+            url = cms_api_video_info_template.format(account_id, batch_size, offset)
             tasks.append(fetch_video_data(session, url, headers, ssl_context))
-            offset += limit
+            offset += batch_size
 
         file_index = 1
         row_count = 0
@@ -158,7 +166,7 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
                         writer.writeheader()
 
                     for video in video_data:
-                        if row_count == 10000:
+                        if row_count == 5000:
                             # Close the current file and start a new one
                             file.close()
                             file_index += 1
@@ -181,6 +189,11 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
             # Ensure the last file is closed
             if row_count > 0:
                 file.close()
+
+        pbar.n = row_count  # Update the progress bar to the correct count
+        pbar.refresh()
+
+    return created_files
 
 def read_video_ids_from_csv(csv_path):
     video_ids = []
@@ -362,22 +375,22 @@ async def main(max_videos=None):
         failure_log_file = f'{account_id}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
         failure_log_path = os.path.join(failure_log_dir, failure_log_file)
         os.makedirs(failure_log_dir, exist_ok=True)
-        await fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore, created_files, max_videos)
+        created_files = await fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore, created_files, max_videos)
         
         for csv_file in created_files:
             csv_path = os.path.join(account_csv_dir, csv_file)
             video_ids = read_video_ids_from_csv(csv_path)
             _, error_count = await fetch_rendition_details(csv_path, account_id, video_ids, failure_log_path)
-            logging.info(f'CSV file {csv_file} updated. Updating CSV order')
+            logging.info(f"CSV file {Fore.CYAN}{csv_file}{Fore.RESET} updated. {Style.BRIGHT}Updating CSV order{Style.RESET_ALL}")
             reorder_csv(csv_path)
-            logging.info(f'Total errors encountered:{Fore.RED} {error_count}{Fore.RESET}')
-
-    logging.info(f'{Style.BRIGHT}Job done. You can find the csv in the following location:{Style.RESET_ALL} {Fore.CYAN}{csv_path}{Fore.RESET}')
+            logging.info(f"Job done: {Fore.CYAN}{csv_path}{Fore.RESET}")
+            
+    logging.info(f"Total errors encountered: {Fore.RED}{error_count}{Fore.RESET}")
+    logging.info(f"{Fore.CYAN}{Style.BRIGHT}Processing complete. Exiting script.{Style.RESET_ALL}{Fore.RESET}")
     sys.exit(0)  # Terminate the script after processing
 
-
 if __name__ == "__main__":
-    max_videos = 50  # Set your limit here or None to process all videos
+    max_videos = None # Set your limit here or None to process all videos
     asyncio.run(main(max_videos))
 
 # snapshot = tracemalloc.take_snapshot()
