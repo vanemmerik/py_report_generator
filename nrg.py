@@ -390,7 +390,7 @@ async def main(max_videos=None):
     sys.exit(0)  # Terminate the script after processing
 
 if __name__ == "__main__":
-    max_videos = 5 # Set your limit here or None to process all videos
+    max_videos = None # Set your limit here or None to process all videos
     asyncio.run(main(max_videos))
 
 # snapshot = tracemalloc.take_snapshot()
