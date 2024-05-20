@@ -38,19 +38,19 @@ client_secret = os.getenv('CLIENT_SECRET')
 csv_dir = os.getenv('CSV_PATH')
 
 # Failure log path based on .env file
-failure_log_dir = os.getenv('LOG_PATH')
+logs_dir = os.getenv('LOG_PATH')
 
 # Brightcove OAuth URL
 oauth_url = 'https://oauth.brightcove.com/v4/access_token'
 
 # Brightcove Ingest API endpoint templates
-cms_api_video_count_template = 'https://cms.api.brightcove.com/v1/accounts/{}/counts/videos'
-cms_api_video_info_template = 'https://cms.api.brightcove.com/v1/accounts/{}/videos?limit={}&offset={}'
-cms_api_dr_template = 'https://cms.api.brightcove.com/v1/accounts/{}/videos/{}/assets/dynamic_renditions'
+cms_api_video_count = 'https://cms.api.brightcove.com/v1/accounts/{}/counts/videos'
+cms_api_video_info = 'https://cms.api.brightcove.com/v1/accounts/{}/videos?limit={}&offset={}'
+cms_api_dr = 'https://cms.api.brightcove.com/v1/accounts/{}/videos/{}/assets/dynamic_renditions'
 cms_api_master_info = 'https://cms.api.brightcove.com/v1/accounts/{}/videos/{}/digital_master'
 
-# Fields to ignore
-fields_to_ignore = {
+# Fields info keys to ignore in API response
+video_info_ignore = {
     'account_id', 'digital_master_id', 'clip_source_video_id', 'created_by',
     'cue_points', 'custom_fields', 'description', 'folder_id', 'images',
     'link', 'long_description', 'projection', 'published_at', 'schedule',
@@ -58,14 +58,14 @@ fields_to_ignore = {
     'playback_rights_id', 'labels'
 }
 
-master_keys_to_ignore = {
+master_keys_ignore = {
     'id', 'created_at', 'updated_at'
 }
 
 # Uncomment the progress bar style you would like to use
 # ascii = "⣀⣄⣤⣦⣶⣷⣿"
-# ascii = "─┄┈┉┅━"
-ascii = "▁▂▃▄▅▆▇█"
+ascii = "─┄┈┉┅━"
+# ascii = "▁▂▃▄▅▆▇█"
 # ascii = "░▏▎▍▌▋▊▉█"
 # ascii = "░▒▓█"
 
@@ -105,7 +105,7 @@ def get_or_refresh_token():
             return None
 
 def get_video_count(account_id, access_token):
-    url = cms_api_video_count_template.format(account_id)
+    url = cms_api_video_count.format(account_id)
     headers = {'Authorization': f'Bearer {access_token}'}
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
@@ -125,7 +125,7 @@ async def fetch_video_data(session, url, headers, ssl_context):
             logging.error(await response.text())
             return None
 
-async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore, created_files, max_videos=None):
+async def fetch_and_write_videos(account_id, access_token, csv_dir, video_info_ignore, created_files, max_videos=None):
     limit = 80
     offset = 0
     total_videos = get_video_count(account_id, access_token)
@@ -142,7 +142,7 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
         tasks = []
         while offset < total_videos:
             batch_size = min(limit, total_videos - offset)  # Adjust the batch size to not exceed total_videos
-            url = cms_api_video_info_template.format(account_id, batch_size, offset)
+            url = cms_api_video_info.format(account_id, batch_size, offset)
             tasks.append(fetch_video_data(session, url, headers, ssl_context))
             offset += batch_size
 
@@ -161,7 +161,7 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ig
                         writer = None
 
                     if not writer:
-                        fieldnames = [key for key in video_data[0].keys() if key not in fields_to_ignore]
+                        fieldnames = [key for key in video_data[0].keys() if key not in video_info_ignore]
                         writer = csv.DictWriter(file, fieldnames=fieldnames)
                         writer.writeheader()
 
@@ -224,7 +224,7 @@ def csv_master_info(csv_path, video_id, data):
         logging.error(f"Video ID {video_id} not found in the CSV.")
         return
 
-    new_data = {f"master_{key}": value for key, value in data.items() if key not in master_keys_to_ignore}
+    new_data = {f"master_{key}": value for key, value in data.items() if key not in master_keys_ignore}
 
     for new_key in new_data.keys():
         if new_key not in fieldnames:
@@ -242,7 +242,7 @@ def flatten_rendition_data(rendition_data):
     flattened_data = {}
     rendition_id = rendition_data['rendition_id'].split('/')[-1]
     for key, value in rendition_data.items():
-        if key in fields_to_ignore or key == 'rendition_id' or value is None:
+        if key in video_info_ignore or key == 'rendition_id' or value is None:
             continue
         if any(ignored_field in key for ignored_field in ['updated_at', 'created_at', 'duration']):
             continue
@@ -250,7 +250,7 @@ def flatten_rendition_data(rendition_data):
         flattened_data[new_key] = value
     return flattened_data
 
-def update_csv_with_json(csv_path, video_id, flattened_renditions):
+def update_csv_json(csv_path, video_id, flattened_renditions):
     with open(csv_path, mode='r', newline='') as csv_file:
         reader = csv.DictReader(csv_file)
         rows = list(reader)
@@ -297,7 +297,7 @@ async def fetch_rendition_details(csv_path, account_id, video_ids, failure_log_p
     async def fetch_and_process(session, video_id, pbar, failure_log):
         nonlocal error_count
         headers = {'Authorization': f'Bearer {get_or_refresh_token()}'}
-        url = cms_api_dr_template.format(account_id, video_id)
+        url = cms_api_dr.format(account_id, video_id)
         master_url = cms_api_master_info.format(account_id, video_id)
 
         async with session.get(master_url, headers=headers, ssl=ssl_context) as master_response:
@@ -317,7 +317,7 @@ async def fetch_rendition_details(csv_path, account_id, video_ids, failure_log_p
                 data = await response.json()
                 renditions_info.append(data)
                 flattened_rendition = json.dumps([flatten_rendition_data(rendition) for rendition in data])
-                update_csv_with_json(csv_path, video_id, flattened_rendition)
+                update_csv_json(csv_path, video_id, flattened_rendition)
             elif response.status == 204:
                 error_count += 1
                 failure_log.write(f"Failed to fetch rendition data for video ID {video_id}: {response.status}\n")
@@ -372,10 +372,10 @@ async def main(max_videos=None):
     if access_token:
         account_csv_dir = os.path.join(csv_dir, account_id)
         os.makedirs(account_csv_dir, exist_ok=True)
-        failure_log_file = f'{account_id}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
-        failure_log_path = os.path.join(failure_log_dir, failure_log_file)
-        os.makedirs(failure_log_dir, exist_ok=True)
-        created_files = await fetch_and_write_videos(account_id, access_token, csv_dir, fields_to_ignore, created_files, max_videos)
+        log_file = f'{account_id}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+        failure_log_path = os.path.join(logs_dir, log_file)
+        os.makedirs(logs_dir, exist_ok=True)
+        created_files = await fetch_and_write_videos(account_id, access_token, csv_dir, video_info_ignore, created_files, max_videos)
         
         for csv_file in created_files:
             csv_path = os.path.join(account_csv_dir, csv_file)
@@ -390,7 +390,7 @@ async def main(max_videos=None):
     sys.exit(0)  # Terminate the script after processing
 
 if __name__ == "__main__":
-    max_videos = None # Set your limit here or None to process all videos
+    max_videos = 5 # Set your limit here or None to process all videos
     asyncio.run(main(max_videos))
 
 # snapshot = tracemalloc.take_snapshot()
