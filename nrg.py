@@ -11,6 +11,8 @@ import logging
 import ssl
 import certifi
 import tracemalloc
+import signal
+import functools
 from tqdm.asyncio import tqdm
 from colorama import Fore, Style, init
 from datetime import datetime
@@ -37,8 +39,12 @@ client_secret = os.getenv('CLIENT_SECRET')
 # CSV path based on .env file
 csv_dir = os.getenv('CSV_PATH')
 
-# Failure log path based on .env file
+# Log path based on .env file
 logs_dir = os.getenv('LOG_PATH')
+
+# Last processed video ID based on .env path
+last_processed_dir = os.getenv('LAST_PROCESSED_PATH')
+last_processed_file = os.path.join(last_processed_dir, 'last_processed.txt')
 
 # Brightcove OAuth URL
 oauth_url = 'https://oauth.brightcove.com/v4/access_token'
@@ -68,6 +74,33 @@ ascii = "─┄┈┉┅━"
 # ascii = "▁▂▃▄▅▆▇█"
 # ascii = "░▏▎▍▌▋▊▉█"
 # ascii = "░▒▓█"
+
+def handle_interrupt(signal, frame, loop, tasks):
+    global interrupted
+    interrupted = True
+    logging.info("Script interrupted. Saving state and exiting...")
+    save_last_processed(current_csv_file, current_video_id)
+    for task in tasks:
+        task.cancel()
+    loop.stop()
+
+def save_last_processed(csv_file, video_id):
+    with open(last_processed_file, 'w') as f:
+        f.write(f"{csv_file}\n{video_id}\n")
+
+def load_last_processed():
+    if os.path.exists(last_processed_file):
+        with open(last_processed_file, 'r') as f:
+            lines = f.read().splitlines()
+            if len(lines) == 2:
+                return lines[0], lines[1]
+    return None, None
+
+# Stored variables for logging and continuation
+current_csv_file = None
+current_video_id = None
+interrupted = False
+
 
 # Global variable to store the access token and expiry time
 token_info = {'access_token': None, 'expires_in': None, 'acquired_at': None}
@@ -166,7 +199,7 @@ async def fetch_and_write_videos(account_id, access_token, csv_dir, video_info_i
                         writer.writeheader()
 
                     for video in video_data:
-                        if row_count == 5000:
+                        if row_count == 5000: # Set row count for csv
                             # Close the current file and start a new one
                             file.close()
                             file_index += 1
@@ -287,18 +320,24 @@ def update_csv_json(csv_path, video_id, flattened_renditions):
         writer.writeheader()
         writer.writerows(rows)
 
-async def fetch_rendition_details(csv_path, account_id, video_ids, failure_log_path):
+async def fetch_rendition_details(csv_path, account_id, video_ids, failure_log_path, resume=False):
+    global current_video_id  # Access the global variable to update the current video ID
     delay = 0.1  # 10 requests per second
     renditions_info = []
     error_count = 0
 
     ssl_context = ssl.create_default_context(cafile=certifi.where())
+    progress_desc = "Interrupted - Resuming Process" if resume else "Fetching Rendition Details"
 
     async def fetch_and_process(session, video_id, pbar, failure_log):
         nonlocal error_count
         headers = {'Authorization': f'Bearer {get_or_refresh_token()}'}
         url = cms_api_dr.format(account_id, video_id)
         master_url = cms_api_master_info.format(account_id, video_id)
+
+        global current_video_id
+        current_video_id = video_id  # Update the current video ID being processed
+        logging.debug(f"Processing video ID: {current_video_id}")
 
         async with session.get(master_url, headers=headers, ssl=ssl_context) as master_response:
             if master_response.status == 200:
@@ -330,15 +369,19 @@ async def fetch_rendition_details(csv_path, account_id, video_ids, failure_log_p
 
     async with aiohttp.ClientSession() as session:
         tasks = []
-        with open(failure_log_path, mode='a') as failure_log, tqdm(total=len(video_ids), desc=f"{Style.BRIGHT}Fetching Rendition Details{Style.RESET_ALL}", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii=ascii) as pbar:
+        with open(failure_log_path, mode='a') as failure_log, tqdm(total=len(video_ids), desc=f"{Style.BRIGHT}{progress_desc}{Style.RESET_ALL}", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii=ascii) as pbar:
             for video_id in video_ids:
                 tasks.append(fetch_and_process(session, video_id, pbar, failure_log))
                 if len(tasks) % 10 == 0:
-                    await asyncio.gather(*tasks)
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    logging.debug(f"Saving state: {current_csv_file}, {current_video_id}")
+                    save_last_processed(current_csv_file, current_video_id)  # Save the state during processing
                     tasks = []
 
             if tasks:
-                await asyncio.gather(*tasks)
+                await asyncio.gather(*tasks, return_exceptions=True)
+                logging.debug(f"Final save state: {current_csv_file}, {current_video_id}")
+                save_last_processed(current_csv_file, current_video_id)  # Save the state after processing
 
     return renditions_info, error_count
 
@@ -365,8 +408,10 @@ def reorder_csv(csv_path):
         writer.writerows(rows)
 
 async def main(max_videos=None):
-    global token_info
+    global token_info, current_csv_file, current_video_id, interrupted
     created_files = []
+    last_csv_file, last_video_id = load_last_processed()
+    total_error_count = 0
 
     access_token = get_or_refresh_token()
     if access_token:
@@ -375,23 +420,75 @@ async def main(max_videos=None):
         log_file = f'{account_id}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
         failure_log_path = os.path.join(logs_dir, log_file)
         os.makedirs(logs_dir, exist_ok=True)
-        created_files = await fetch_and_write_videos(account_id, access_token, csv_dir, video_info_ignore, created_files, max_videos)
-        
-        for csv_file in created_files:
+
+        loop = asyncio.get_running_loop()
+        tasks = []
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_interrupt, sig, None, loop, tasks)
+
+        # Get all existing CSV files in the account directory
+        existing_csv_files = sorted([f for f in os.listdir(account_csv_dir) if f.endswith('.csv')])
+
+        if last_csv_file and last_video_id:
+            # Extract filename from the full path
+            last_csv_filename = os.path.basename(last_csv_file)
+            # Continue from last processed state
+            try:
+                resume_from_index = existing_csv_files.index(last_csv_filename)
+            except ValueError:
+                logging.error(f"Last processed file {last_csv_filename} not found in existing CSV files.")
+                resume_from_index = 0
+            existing_csv_files = existing_csv_files[resume_from_index:]
+        else:
+            # Start from scratch
+            created_files = await fetch_and_write_videos(account_id, access_token, csv_dir, video_info_ignore, created_files, max_videos)
+            existing_csv_files = created_files
+
+        for csv_file in existing_csv_files:
             csv_path = os.path.join(account_csv_dir, csv_file)
             video_ids = read_video_ids_from_csv(csv_path)
-            _, error_count = await fetch_rendition_details(csv_path, account_id, video_ids, failure_log_path)
-            logging.info(f"CSV file {Fore.CYAN}{csv_file}{Fore.RESET} updated. {Style.BRIGHT}Updating CSV order{Style.RESET_ALL}")
-            reorder_csv(csv_path)
-            logging.info(f"Job done: {Fore.CYAN}{csv_path}{Fore.RESET}")
-            
-    logging.info(f"Total errors encountered: {Fore.RED}{error_count}{Fore.RESET}")
-    logging.info(f"{Fore.CYAN}{Style.BRIGHT}Processing complete. Exiting script.{Style.RESET_ALL}{Fore.RESET}")
+
+            if last_csv_file and csv_file == last_csv_filename:
+                try:
+                    start_index = video_ids.index(last_video_id) + 1
+                except ValueError:
+                    logging.warning(f"Last processed video ID {last_video_id} not found in CSV {csv_file}. Starting from the beginning of this file.")
+                    start_index = 0
+                video_ids = video_ids[start_index:]
+
+            if video_ids:
+                current_csv_file = csv_file  # Update the current CSV file being processed
+                task = asyncio.create_task(fetch_rendition_details(csv_path, account_id, video_ids, failure_log_path, resume=bool(last_csv_file)))
+                tasks.append(task)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, tuple) and len(result) == 2:
+                        _, error_count = result
+                        total_error_count += error_count
+                save_last_processed(csv_path, video_ids[-1])  # Save the state after processing the batch
+                logging.info(f"CSV file {Fore.CYAN}{csv_file}{Fore.RESET} updated. {Style.BRIGHT}Updating CSV order{Style.RESET_ALL}")
+                reorder_csv(csv_path)
+                logging.info(f"Job done: {Fore.CYAN}{csv_path}{Fore.RESET}")
+
+    if not interrupted:
+        if os.path.exists(last_processed_file):
+            os.remove(last_processed_file)
+        logging.info(f"{Fore.CYAN}{Style.BRIGHT}Processing complete. Exiting script.{Style.RESET_ALL}{Fore.RESET}")
+        logging.info(f"Total errors encountered: {Fore.RED}{total_error_count}{Fore.RESET}. Check the log file for details.")
+    else:
+        logging.info(f"Total errors encountered: {Fore.RED}{total_error_count}{Fore.RESET}")
+
     sys.exit(0)  # Terminate the script after processing
 
 if __name__ == "__main__":
     max_videos = None # Set your limit here or None to process all videos
-    asyncio.run(main(max_videos))
+    try:
+        asyncio.run(main(max_videos))
+    except KeyboardInterrupt:
+        logging.info("KeyboardInterrupt caught. Exiting gracefully...")
+        save_last_processed(current_csv_file, current_video_id)
+        sys.exit(0)
 
 # snapshot = tracemalloc.take_snapshot()
 # top_stats = snapshot.statistics('lineno')
