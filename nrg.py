@@ -13,6 +13,7 @@ import certifi
 import tracemalloc
 import signal
 import functools
+from concurrent.futures import ThreadPoolExecutor
 from tqdm.asyncio import tqdm
 from colorama import Fore, Style, init
 from datetime import datetime
@@ -339,47 +340,54 @@ async def fetch_rendition_details(csv_path, account_id, video_ids, failure_log_p
         current_video_id = video_id  # Update the current video ID being processed
         logging.debug(f"Processing video ID: {current_video_id}")
 
-        async with session.get(master_url, headers=headers, ssl=ssl_context) as master_response:
-            if master_response.status == 200:
-                master_data = await master_response.json()
-                csv_master_info(csv_path, video_id, master_data)
-            elif master_response.status == 204:
-                error_count += 1
-                failure_log.write(f"Failed to fetch master data for video ID {video_id}: {master_response.status}\n")
-            else:
-                error_count += 1
-                failure_log.write(f"Failed to fetch master data for video ID {video_id}: {master_response.status}\n")
-                failure_log.write(await master_response.text() + "\n")
+        try:
+            async with session.get(master_url, headers=headers, ssl=ssl_context) as master_response:
+                if master_response.status == 200:
+                    master_data = await master_response.json()
+                    csv_master_info(csv_path, video_id, master_data)
+                elif master_response.status == 204:
+                    error_count += 1
+                    failure_log.write(f"Failed to fetch master data for video ID {video_id}: {master_response.status}\n")
+                else:
+                    error_count += 1
+                    failure_log.write(f"Failed to fetch master data for video ID {video_id}: {master_response.status}\n")
+                    failure_log.write(await master_response.text() + "\n")
 
-        async with session.get(url, headers=headers, ssl=ssl_context) as response:
-            if response.status == 200:
-                data = await response.json()
-                renditions_info.append(data)
-                flattened_rendition = json.dumps([flatten_rendition_data(rendition) for rendition in data])
-                update_csv_json(csv_path, video_id, flattened_rendition)
-            elif response.status == 204:
-                error_count += 1
-                failure_log.write(f"Failed to fetch rendition data for video ID {video_id}: {response.status}\n")
-            else:
-                error_count += 1
-                failure_log.write(f"Failed to fetch rendition data for video ID {video_id}: {response.status}\n")
-                failure_log.write(await response.text() + "\n")
-            await asyncio.sleep(delay)
+            async with session.get(url, headers=headers, ssl=ssl_context) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    renditions_info.append(data)
+                    flattened_rendition = json.dumps([flatten_rendition_data(rendition) for rendition in data])
+                    update_csv_json(csv_path, video_id, flattened_rendition)
+                elif response.status == 204:
+                    error_count += 1
+                    failure_log.write(f"Failed to fetch rendition data for video ID {video_id}: {response.status}\n")
+                else:
+                    error_count += 1
+                    failure_log.write(f"Failed to fetch rendition data for video ID {video_id}: {response.status}\n")
+                    failure_log.write(await response.text() + "\n")
+        except Exception as e:
+            logging.error(f"Error processing video ID {video_id}: {e}")
+            error_count += 1
+            failure_log.write(f"Error processing video ID {video_id}: {e}\n")
+
+        await asyncio.sleep(delay)
         pbar.update(1)
 
     async with aiohttp.ClientSession() as session:
         tasks = []
         with open(failure_log_path, mode='a') as failure_log, tqdm(total=len(video_ids), desc=f"{Style.BRIGHT}{progress_desc}{Style.RESET_ALL}", bar_format=f"{Fore.GREEN}{{l_bar}}{Fore.RED}{{bar}}{Fore.RESET}{Fore.CYAN}{{r_bar}}{Fore.RESET}", ascii=ascii) as pbar:
             for video_id in video_ids:
-                tasks.append(fetch_and_process(session, video_id, pbar, failure_log))
-                if len(tasks) % 10 == 0:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                task = fetch_and_process(session, video_id, pbar, failure_log)
+                tasks.append(task)
+                if len(tasks) % 10 == 0:  # Adjust this value based on API rate limits
+                    await asyncio.gather(*tasks)
                     logging.debug(f"Saving state: {current_csv_file}, {current_video_id}")
                     save_last_processed(current_csv_file, current_video_id)  # Save the state during processing
                     tasks = []
 
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks)
                 logging.debug(f"Final save state: {current_csv_file}, {current_video_id}")
                 save_last_processed(current_csv_file, current_video_id)  # Save the state after processing
 
@@ -475,7 +483,7 @@ async def main(max_videos=None):
         if os.path.exists(last_processed_file):
             os.remove(last_processed_file)
         logging.info(f"{Fore.CYAN}{Style.BRIGHT}Processing complete. Exiting script.{Style.RESET_ALL}{Fore.RESET}")
-        logging.info(f"Total errors encountered: {Fore.RED}{total_error_count}{Fore.RESET}. Check the log file for details.")
+        logging.info(f"Total errors encountered: {Fore.RED}{Style.BRIGHT}{total_error_count}{Style.RESET_ALL}{Fore.RESET}. Check the log file for details.")
     else:
         logging.info(f"Total errors encountered: {Fore.RED}{total_error_count}{Fore.RESET}")
 
