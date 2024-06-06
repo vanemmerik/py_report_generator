@@ -153,4 +153,5 @@ cython_debug/
 csv/*
 logs/*
 scratch/*
+db/*
 .DS_Store
