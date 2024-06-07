@@ -36,45 +36,50 @@ ENDPOINTS = {
     'digital_master': '/videos/{}/digital_master'
 }
 
-def db_connection():
-    return sqlite3.connect(DB_PATH)
-
-import sqlite3
+# Metadata for table schemas
+TABLE_SCHEMAS = {
+    "accounts": {
+        "columns": {
+            "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "account_id": "TEXT UNIQUE NOT NULL"
+        },
+        "indexes": ["account_id"]
+    },
+    "videos": {
+        "columns": {
+            "id": "TEXT PRIMARY KEY",
+            "account_id": "TEXT",
+            "created_at": "TEXT",
+            "updated_at": "TEXT",
+            "name": "TEXT",
+            "description": "TEXT",
+            "duration": "INTEGER",
+            "state": "TEXT",
+            "tags": "TEXT",
+            "json_response": "TEXT",
+            "master_id": "TEXT",
+            "master_size": "INTEGER",
+            "master_width": "INTEGER",
+            "master_height": "INTEGER",
+            "master_duration": "INTEGER",
+            "master_json": "TEXT"
+        },
+        "indexes": ["account_id", "name", "state"]
+    }
+}
 
 def db_connection():
     return sqlite3.connect(DB_PATH)
 
 def setup_database():
-    """Set up the database with the required tables and indexes."""
+    """Set up the database with tables and indexes based on metadata."""
     with db_connection() as conn:
         cursor = conn.cursor()
-        # Create accounts table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id TEXT UNIQUE NOT NULL
-            )
-        """)
-        # Create videos table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS videos (
-                id TEXT PRIMARY KEY,
-                account_id TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                name TEXT,
-                description TEXT,
-                duration INTEGER,
-                state TEXT,
-                tags TEXT,
-                json_response TEXT,
-                FOREIGN KEY(account_id) REFERENCES accounts(account_id)
-            )
-        """)
-        # Create indexes for better performance
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_account_id ON videos(account_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_name ON videos(name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_state ON videos(state)")
+        for table, schema in TABLE_SCHEMAS.items():
+            columns = ", ".join(f"{col} {dtype}" for col, dtype in schema["columns"].items())
+            cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} ({columns})")
+            for index in schema["indexes"]:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_{index} ON {table}({index})")
         conn.commit()
 
 setup_database()  # Set up the database
@@ -129,6 +134,23 @@ async def api_request(session, account_id, endpoint_key, *args):
         else:
             raise Exception(f'Request failed: {response.status}, {await response.text()}')
 
+def insert_into_table(conn, table_name, data):
+    """Insert data into a table dynamically based on metadata."""
+    if table_name not in TABLE_SCHEMAS:
+        raise ValueError(f"Table {table_name} does not exist in the schema metadata.")
+    
+    columns = TABLE_SCHEMAS[table_name]["columns"]
+    keys = data.keys()
+    if not all(key in columns for key in keys):
+        raise ValueError(f"Some keys in data are not in the schema for table {table_name}.")
+    
+    cols = ", ".join(keys)
+    placeholders = ", ".join("?" for _ in keys)
+    sql = f"INSERT OR REPLACE INTO {table_name} ({cols}) VALUES ({placeholders})"
+    values = [data[key] for key in keys]
+    with conn:
+        conn.execute(sql, values)
+
 async def fetch_video_info(account_id):
     limit = 90
     db_lock = asyncio.Lock()
@@ -151,7 +173,7 @@ async def fetch_video_info(account_id):
         # Insert account info into the accounts table if it doesn't exist
         with db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO accounts (account_id) VALUES (?)", (account_id,))
+            insert_into_table(conn, "accounts", {"account_id": account_id})
             conn.commit()
 
         batch_size = 1000  # Adjust batch size based on your requirements
@@ -163,40 +185,98 @@ async def fetch_video_info(account_id):
                 try:
                     async with db_lock:
                         with db_connection() as conn:
-                            cursor = conn.cursor()
                             for video in response:
                                 videos_processed += 1
                                 pbar.update(1)
-                                # Extract fields
-                                video_id = video.get('id')
-                                created_at = video.get('created_at')
-                                updated_at = video.get('updated_at')
-                                name = video.get('name')
-                                description = video.get('description')
-                                duration = video.get('duration')
-                                state = video.get('state')
-                                tags = ','.join(video.get('tags', []))
-                                json_response = json.dumps(video)
+                                # Prepare video data
+                                video_data = {
+                                    "id": video.get('id'),
+                                    "account_id": account_id,
+                                    "created_at": video.get('created_at'),
+                                    "updated_at": video.get('updated_at'),
+                                    "name": video.get('name'),
+                                    "description": video.get('description'),
+                                    "duration": video.get('duration'),
+                                    "state": video.get('state'),
+                                    "tags": ','.join(video.get('tags', [])),
+                                    "json_response": json.dumps(video)
+                                }
                                 
-                                video_batch.append((video_id, account_id, created_at, updated_at, name, description, duration, state, tags, json_response))
+                                video_batch.append(video_data)
                                 if len(video_batch) >= batch_size:
-                                    cursor.executemany(
-                                        "INSERT OR REPLACE INTO videos (id, account_id, created_at, updated_at, name, description, duration, state, tags, json_response) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                                        video_batch
-                                    )
+                                    for v_data in video_batch:
+                                        insert_into_table(conn, "videos", v_data)
                                     video_batch = []
                             if video_batch:
-                                cursor.executemany(
-                                    "INSERT OR REPLACE INTO videos (id, account_id, created_at, updated_at, name, description, duration, state, tags, json_response) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                                    video_batch
-                                )
+                                for v_data in video_batch:
+                                    insert_into_table(conn, "videos", v_data)
                             conn.commit()
                 except Exception as e:
                     print(f'Error: {e}')
 
+async def fetch_master_info(account_id):
+    async with aiohttp.ClientSession() as session:
+        db_lock = asyncio.Lock()
+
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM videos WHERE account_id = ?", (account_id,))
+            video_ids = [row[0] for row in cursor.fetchall()]
+
+        total_videos = len(video_ids)
+        pbar = progress_bar(total_videos, "Fetching master info")
+        
+        tasks = []
+        for video_id in video_ids:
+            try:
+                endpoint = ENDPOINTS['digital_master'].format(video_id)
+                # print(f"Fetching URL: {endpoint}")
+                tasks.append(api_request(session, account_id, 'digital_master', video_id))
+            except KeyError as e:
+                print(f"Key error while formatting endpoint for video ID {video_id}: {e}")
+                continue
+
+        with pbar:
+            for future in asyncio.as_completed(tasks):
+                try:
+                    response = await future
+                    if response:  # Ensure response is not None or empty
+                        async with db_lock:
+                            with db_connection() as conn:
+                                master_data = {
+                                    "id": video_id,
+                                    "master_id": response.get('id', None),
+                                    "master_size": response.get('size', None),
+                                    "master_width": response.get('width', None),
+                                    "master_height": response.get('height', None),
+                                    "master_duration": response.get('duration', None),
+                                    "master_json": json.dumps(response) if response else None
+                                }
+                                cursor.execute("""
+                                    UPDATE videos
+                                    SET master_id = :master_id,
+                                        master_size = :master_size,
+                                        master_width = :master_width,
+                                        master_height = :master_height,
+                                        master_duration = :master_duration,
+                                        master_json = :master_json
+                                    WHERE id = :id
+                                """, master_data)
+                                conn.commit()
+                    else:
+                        print(f'No master info for video ID: {video_id}')
+                except KeyError as e:
+                    print(f"Key error for {video_id}: {e}")
+                except Exception as e:
+                    print(f'Error processing video ID {video_id}: {e}')
+                finally:
+                    pbar.update(1)
+
 async def main():
-    account_ids = [PUB_ID]  # List of account IDs to process
-    await asyncio.gather(*(fetch_video_info(account_id) for account_id in account_ids))
+    account_ids = [PUB_ID]
+    for account_id in account_ids:
+        await fetch_video_info(account_id)
+        await fetch_master_info(account_id)
 
 if __name__ == '__main__':
     asyncio.run(main())
