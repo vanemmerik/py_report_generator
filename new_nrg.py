@@ -158,15 +158,15 @@ async def api_request(session, account_id, endpoint_key, *args):
                 try:
                     return await response.json()
                 except aiohttp.ContentTypeError:
-                    log_event(f'Non-JSON response for URL: {url}', 'ERROR')
+                    # log_event(f'Non-JSON response for URL: {url}', 'ERROR')
                     return None
             else:
-                log_event(f'Request failed for URL: {url}, status: {response.status}')
+                log_event(f'Request failed for URL: {url}, status: {response.status}', 'ERROR')
                 return None
     except IndexError as e:
-        print(f"Error formatting URL with args: {args}, Error: {e}")
+        log_event(f"Error formatting URL with args: {args}, Error: {e}", "ERROR")
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        log_event(f"Unexpected error: {e}", "ERROR")
 
 def insert_into_table(conn, table_name, data):
     if table_name not in TABLE_SCHEMAS:
