@@ -1,5 +1,7 @@
 import os
 import time
+from datetime import datetime
+import logging
 import asyncio
 import aiohttp
 import ssl
@@ -27,6 +29,7 @@ ascii = "⣀⣄⣤⣦⣶⣷⣿"
 PUB_ID = os.getenv('PUB_ID')
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+LOGS = os.getenv('LOG_PATH')
 DB_PATH = os.getenv('SQL_DB_PATH')
 BASE_URL = 'https://cms.api.brightcove.com/v1/accounts/{}'
 ENDPOINTS = {
@@ -35,6 +38,31 @@ ENDPOINTS = {
     'dynamic_renditions': '/videos/{}/assets/dynamic_renditions',
     'digital_master': '/videos/{}/digital_master'
 }
+
+# Logging stuff
+
+log_file = f'{PUB_ID}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+log_path = os.path.join(LOGS, log_file)
+os.makedirs(LOGS, exist_ok=True)
+logging.basicConfig(
+    filename = log_path,
+    level = logging.INFO,
+    format = '%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def log_event(event_message, level='INFO'):
+    if level == 'DEBUG':
+        logging.debug(event_message)
+    elif level == 'INFO':
+        logging.info(event_message)
+    elif level == 'WARNING':
+        logging.warning(event_message)
+    elif level == 'ERROR':
+        logging.error(event_message)
+    elif level == 'CRITICAL':
+        logging.critical(event_message)
+    else:
+        logging.info(event_message)
 
 # Metadata for table schemas
 TABLE_SCHEMAS = {
@@ -52,16 +80,17 @@ TABLE_SCHEMAS = {
             "created_at": "TEXT",
             "updated_at": "TEXT",
             "name": "TEXT",
-            "description": "TEXT",
             "duration": "INTEGER",
             "state": "TEXT",
-            "tags": "TEXT",
+            "delivery_type": "TEXT",
+            "has_master": "TEXT",
             "json_response": "TEXT",
             "master_id": "TEXT",
             "master_size": "INTEGER",
             "master_width": "INTEGER",
             "master_height": "INTEGER",
             "master_duration": "INTEGER",
+            "master_encoding_rate": "INTEGER",
             "master_json": "TEXT"
         },
         "indexes": ["account_id", "name", "state"]
@@ -72,7 +101,6 @@ def db_connection():
     return sqlite3.connect(DB_PATH)
 
 def setup_database():
-    """Set up the database with tables and indexes based on metadata."""
     with db_connection() as conn:
         cursor = conn.cursor()
         for table, schema in TABLE_SCHEMAS.items():
@@ -95,7 +123,6 @@ def progress_bar(total, desc):
     return tqdm(total=total, desc=desc, bar_format=bar_format, ascii=ascii, ncols=None)
 
 async def get_token():
-    """Get a new token from Brightcove OAuth API."""
     url = f'https://oauth.brightcove.com/v4/access_token'
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded'
@@ -109,33 +136,39 @@ async def get_token():
             if response.status == 200:
                 token_data = await response.json()
                 token_info['token'] = token_data['access_token']
-                # Set the token expiry time (current time + expires_in seconds - 10 seconds for buffer)
                 token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
-                print("New token fetched")
+                # print("New token fetched")
             else:
                 raise Exception('Failed to get token: {}'.format(await response.text()))
 
 async def get_valid_token():
-    """Get a valid token, refreshing it if necessary."""
     if time.time() >= token_info['expires_at']:
         await get_token()
     return token_info['token']
 
 async def api_request(session, account_id, endpoint_key, *args):
-    url = BASE_URL.format(account_id) + ENDPOINTS[endpoint_key].format(*args)
-    token = await get_valid_token()
-    headers = {
-        'Authorization': f'Bearer {token}'
-    }
-
-    async with session.get(url, headers=headers, ssl=ssl_context) as response:
-        if response.status in range(200, 299):
-            return await response.json()
-        else:
-            raise Exception(f'Request failed: {response.status}, {await response.text()}')
+    try:
+        url = BASE_URL.format(account_id) + ENDPOINTS[endpoint_key].format(*args)
+        token = await get_valid_token()
+        headers = {
+            'Authorization': f'Bearer {token}'
+        }
+        async with session.get(url, headers=headers, ssl=ssl_context) as response:
+            if response.status in range(200, 299):
+                try:
+                    return await response.json()
+                except aiohttp.ContentTypeError:
+                    log_event(f'Non-JSON response for URL: {url}', 'ERROR')
+                    return None
+            else:
+                log_event(f'Request failed for URL: {url}, status: {response.status}')
+                return None
+    except IndexError as e:
+        print(f"Error formatting URL with args: {args}, Error: {e}")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
 
 def insert_into_table(conn, table_name, data):
-    """Insert data into a table dynamically based on metadata."""
     if table_name not in TABLE_SCHEMAS:
         raise ValueError(f"Table {table_name} does not exist in the schema metadata.")
     
@@ -151,7 +184,7 @@ def insert_into_table(conn, table_name, data):
     with conn:
         conn.execute(sql, values)
 
-async def fetch_video_info(account_id):
+async def ret_videos(account_id):
     limit = 90
     db_lock = asyncio.Lock()
 
@@ -172,7 +205,6 @@ async def fetch_video_info(account_id):
         
         # Insert account info into the accounts table if it doesn't exist
         with db_connection() as conn:
-            cursor = conn.cursor()
             insert_into_table(conn, "accounts", {"account_id": account_id})
             conn.commit()
 
@@ -188,17 +220,16 @@ async def fetch_video_info(account_id):
                             for video in response:
                                 videos_processed += 1
                                 pbar.update(1)
-                                # Prepare video data
                                 video_data = {
                                     "id": video.get('id'),
                                     "account_id": account_id,
                                     "created_at": video.get('created_at'),
                                     "updated_at": video.get('updated_at'),
                                     "name": video.get('name'),
-                                    "description": video.get('description'),
                                     "duration": video.get('duration'),
                                     "state": video.get('state'),
-                                    "tags": ','.join(video.get('tags', [])),
+                                    "delivery_type": video.get('delivery_type'),
+                                    "has_master": str(video.get('has_digital_master', False)),
                                     "json_response": json.dumps(video)
                                 }
                                 
@@ -214,10 +245,11 @@ async def fetch_video_info(account_id):
                 except Exception as e:
                     print(f'Error: {e}')
 
-async def fetch_master_info(account_id):
+async def ret_masters(account_id):
     async with aiohttp.ClientSession() as session:
         db_lock = asyncio.Lock()
 
+        # Fetch all video IDs for the given account ID
         with db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT id FROM videos WHERE account_id = ?", (account_id,))
@@ -225,58 +257,69 @@ async def fetch_master_info(account_id):
 
         total_videos = len(video_ids)
         pbar = progress_bar(total_videos, "Fetching master info")
-        
+
         tasks = []
         for video_id in video_ids:
-            try:
-                endpoint = ENDPOINTS['digital_master'].format(video_id)
-                # print(f"Fetching URL: {endpoint}")
-                tasks.append(api_request(session, account_id, 'digital_master', video_id))
-            except KeyError as e:
-                print(f"Key error while formatting endpoint for video ID {video_id}: {e}")
-                continue
+            # Pass video_id explicitly to ensure correct handling
+            tasks.append(update_master_info(session, db_lock, account_id, video_id))
 
+        # Process tasks and update the progress bar
         with pbar:
             for future in asyncio.as_completed(tasks):
-                try:
-                    response = await future
-                    if response:  # Ensure response is not None or empty
-                        async with db_lock:
-                            with db_connection() as conn:
-                                master_data = {
-                                    "id": video_id,
-                                    "master_id": response.get('id', None),
-                                    "master_size": response.get('size', None),
-                                    "master_width": response.get('width', None),
-                                    "master_height": response.get('height', None),
-                                    "master_duration": response.get('duration', None),
-                                    "master_json": json.dumps(response) if response else None
-                                }
-                                cursor.execute("""
-                                    UPDATE videos
-                                    SET master_id = :master_id,
-                                        master_size = :master_size,
-                                        master_width = :master_width,
-                                        master_height = :master_height,
-                                        master_duration = :master_duration,
-                                        master_json = :master_json
-                                    WHERE id = :id
-                                """, master_data)
-                                conn.commit()
-                    else:
-                        print(f'No master info for video ID: {video_id}')
-                except KeyError as e:
-                    print(f"Key error for {video_id}: {e}")
-                except Exception as e:
-                    print(f'Error processing video ID {video_id}: {e}')
-                finally:
-                    pbar.update(1)
+                await future
+                pbar.update(1)
+
+async def update_master_info(session, db_lock, account_id, video_id):
+    try:
+        # Pass video_id explicitly as an argument
+        response = await api_request(session, account_id, 'digital_master', video_id)
+        if response:
+            master_data = {
+                "id": video_id,
+                "master_id": response.get('id', None),
+                "master_size": response.get('size', None),
+                "master_width": response.get('width', None),
+                "master_height": response.get('height', None),
+                "master_duration": response.get('duration', None),
+                "master_encoding_rate": response.get('encoding_rate', None),
+                "master_json": json.dumps(response) if response else None
+            }
+            async with db_lock:
+                with db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE videos
+                        SET master_id = ?,
+                            master_size = ?,
+                            master_width = ?,
+                            master_height = ?,
+                            master_duration = ?,
+                            master_encoding_rate = ?,   
+                            master_json = ?
+                        WHERE id = ?
+                    """, (
+                        master_data["master_id"],
+                        master_data["master_size"],
+                        master_data["master_width"],
+                        master_data["master_height"],
+                        master_data["master_duration"],
+                        master_data["master_encoding_rate"],
+                        master_data["master_json"],
+                        master_data["id"]
+                    ))
+                    conn.commit()
+        else:
+            log_event(f'No master info for video ID: {video_id}')
+    except aiohttp.ContentTypeError as e:
+        log_event(f'Non-JSON response for video ID: {video_id}. Error: {e}', level='ERROR')
+    except Exception as e:
+        print(f'Error processing video ID {video_id}: {e}')
 
 async def main():
     account_ids = [PUB_ID]
     for account_id in account_ids:
-        await fetch_video_info(account_id)
-        await fetch_master_info(account_id)
+        await ret_videos(account_id)
+        await ret_masters(account_id)
 
 if __name__ == '__main__':
     asyncio.run(main())
