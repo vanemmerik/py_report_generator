@@ -158,15 +158,15 @@ async def api_request(session, account_id, endpoint_key, *args):
                 try:
                     return await response.json()
                 except aiohttp.ContentTypeError:
-                    # log_event(f'Non-JSON response for URL: {url}', 'ERROR')
+                    log_event(f'Non-JSON response for URL: {url}', level='ERROR')
                     return None
             else:
-                log_event(f'Request failed for URL: {url}, status: {response.status}', 'ERROR')
+                log_event(f'Request failed for URL: {url}, status: {response.status}', level='ERROR')
                 return None
     except IndexError as e:
-        log_event(f"Error formatting URL with args: {args}, Error: {e}", "ERROR")
+        log_event(f"Error formatting URL with args: {args}, Error: {e}", level="ERROR")
     except Exception as e:
-        log_event(f"Unexpected error: {e}", "ERROR")
+        log_event(f"Unexpected error: {e}", level="ERROR")
 
 def insert_into_table(conn, table_name, data):
     if table_name not in TABLE_SCHEMAS:
@@ -203,12 +203,11 @@ async def ret_videos(account_id):
         videos_processed = 0
         pbar = progress_bar(total_videos, "Processing videos")
         
-        # Insert account info into the accounts table if it doesn't exist
         with db_connection() as conn:
             insert_into_table(conn, "accounts", {"account_id": account_id})
             conn.commit()
 
-        batch_size = 1000  # Adjust batch size based on your requirements
+        batch_size = 5000  # Adjust batch size based on your requirements
         video_batch = []
 
         with pbar:
@@ -249,21 +248,31 @@ async def ret_masters(account_id):
     async with aiohttp.ClientSession() as session:
         db_lock = asyncio.Lock()
 
-        # Fetch all video IDs for the given account ID
         with db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM videos WHERE account_id = ?", (account_id,))
-            video_ids = [row[0] for row in cursor.fetchall()]
+            cursor.execute("SELECT id, has_master FROM videos WHERE account_id = ?", (account_id,))
+            video_data = cursor.fetchall()
 
-        total_videos = len(video_ids)
+        total_videos = len(video_data)
         pbar = progress_bar(total_videos, "Fetching master info")
 
         tasks = []
-        for video_id in video_ids:
-            # Pass video_id explicitly to ensure correct handling
+        skipped_videos = 0
+
+        for video_id, has_master in video_data:
+            if not has_master or has_master.lower() == 'false':
+                skipped_videos += 1
+                log_event(f"Skipping video ID: {video_id} because it has no master data.", level="DEBUG")
+                pbar.update(1)
+                continue
+
             tasks.append(update_master_info(session, db_lock, account_id, video_id))
 
-        # Process tasks and update the progress bar
+        if not tasks:
+            log_event("No tasks to process as all videos were skipped.", level="INFO")
+            pbar.close()
+            return
+
         with pbar:
             for future in asyncio.as_completed(tasks):
                 await future
@@ -271,7 +280,6 @@ async def ret_masters(account_id):
 
 async def update_master_info(session, db_lock, account_id, video_id):
     try:
-        # Pass video_id explicitly as an argument
         response = await api_request(session, account_id, 'digital_master', video_id)
         if response:
             master_data = {
@@ -284,6 +292,7 @@ async def update_master_info(session, db_lock, account_id, video_id):
                 "master_encoding_rate": response.get('encoding_rate', None),
                 "master_json": json.dumps(response) if response else None
             }
+
             async with db_lock:
                 with db_connection() as conn:
                     cursor = conn.cursor()
@@ -294,7 +303,7 @@ async def update_master_info(session, db_lock, account_id, video_id):
                             master_width = ?,
                             master_height = ?,
                             master_duration = ?,
-                            master_encoding_rate = ?,   
+                            master_encoding_rate = ?,
                             master_json = ?
                         WHERE id = ?
                     """, (
@@ -309,11 +318,10 @@ async def update_master_info(session, db_lock, account_id, video_id):
                     ))
                     conn.commit()
         else:
-            log_event(f'No master info for video ID: {video_id}')
-    except aiohttp.ContentTypeError as e:
-        log_event(f'Non-JSON response for video ID: {video_id}. Error: {e}', level='ERROR')
+            # Skip non-JSON responses quietly
+            pass
     except Exception as e:
-        print(f'Error processing video ID {video_id}: {e}')
+        log_event(f'Error processing video ID {video_id}: {e}', level="ERROR")
 
 async def main():
     account_ids = [PUB_ID]
