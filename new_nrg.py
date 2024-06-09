@@ -12,13 +12,13 @@ from tqdm.asyncio import tqdm
 from colorama import Fore, Style, init as colorama_init
 import sqlite3
 
-# Initialize colorama
+# Initialise colorama
 colorama_init(autoreset=True)
 
 # Load .env file
 load_dotenv()
 
-# Uncomment the progress bar style you would like to use
+# Progress bar style in use
 ascii = "⣀⣄⣤⣦⣶⣷⣿"
 # ascii = "─┄┈┉┅━"
 # ascii = "▁▂▃▄▅▆▇█"
@@ -84,7 +84,7 @@ def log_event(event_message, level='INFO'):
     else:
         logging.info(event_message)
 
-# Metadata for table schemas
+# Metadata table schema
 TABLE_SCHEMAS = {
     "accounts": {
         "columns": {
@@ -113,30 +113,64 @@ TABLE_SCHEMAS = {
             "master_encoding_rate": "INTEGER",
             "master_json": "TEXT"
         },
-        "indexes": ["account_id", "name", "state"]
+        "indexes": ["account_id", "id"]
+    },
+    "renditions": {
+        "columns": {
+            "video_id": "TEXT",
+            "rendition_id": "TEXT",
+            "frame_width": "INTEGER",
+            "frame_height": "INTEGER",
+            "media_type": "TEXT",
+            "size": "INTEGER",
+            "created_at": "TEXT",
+            "updated_at": "TEXT",
+            "encoding_rate": "INTEGER",
+            "duration": "INTEGER",
+            "variant": "TEXT",
+            "codec": "TEXT",
+            "audio_configuration": "TEXT",
+            "language": "TEXT",
+            "rendition_json": "TEXT"
+        },
+        "indexes": ["video_id", "rendition_id"]
     }
 }
 
+# Global DB var
+global_db_conn = None
+
 def db_connection():
-    return sqlite3.connect(DB_PATH)
+    global global_db_conn
+    if global_db_conn is None:
+        global_db_conn = sqlite3.connect(DB_PATH)
+    return global_db_conn
 
 def setup_database():
     with db_connection() as conn:
         cursor = conn.cursor()
         for table, schema in TABLE_SCHEMAS.items():
             columns = ", ".join(f"{col} {dtype}" for col, dtype in schema["columns"].items())
-            cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} ({columns})")
+            if table == "renditions":
+                # Special handling for renditions to add composite primary key
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        {columns},
+                        PRIMARY KEY (video_id, rendition_id)
+                    )
+                """)
+            else:
+                cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} ({columns})")
             for index in schema["indexes"]:
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_{index} ON {table}({index})")
         conn.commit()
- 
- # Set up the database
-setup_database() 
 
-# Global variable to store the token 
+setup_database()
+
+# Store the token
 token_info = {'token': None, 'expires_at': 0}
 
-# SSL context to use certifi's CA bundle
+# SSL CA bundle
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 def progress_bar(total, desc):
@@ -179,7 +213,7 @@ async def api_request(session, account_id, endpoint_key, *args):
                 try:
                     return await response.json()
                 except aiohttp.ContentTypeError:
-                    log_event(f'Non-JSON response for video ID: {f_args} – URL: {url}', level='ERROR')
+                    log_event(f'Non-JSON response for video ID: {f_args} - URL: {url}', level='ERROR')
                     return None
             if response.status == 429:
                         retry_after = response.headers.get('Retry-After', 1)
@@ -218,7 +252,6 @@ async def ret_videos(account_id):
         count = await api_request(session, account_id, 'video_count')
         total_videos = count['count']
         iteration = (total_videos + limit - 1) // limit
-        semaphore = asyncio.Semaphore(10)  # Limit the number of concurrent requests
 
         async def fetch_with_sem(session, account_id, endpoint_key, *args):
             async with semaphore:
@@ -232,11 +265,12 @@ async def ret_videos(account_id):
         with db_connection() as conn:
             insert_into_table(conn, "accounts", {"account_id": account_id})
             conn.commit()
-
-        batch_size = 200
+    
+        batch_size = 200 # Batch size - writing blocks to DB
         video_batch = []
-        try:
-            with pbar:
+
+        with pbar:
+            try:
                 for future in asyncio.as_completed(tasks):
                     response = await future
                     try:
@@ -257,7 +291,7 @@ async def ret_videos(account_id):
                                         "has_master": str(video.get('has_digital_master', False)),
                                         "json_response": json.dumps(video)
                                     }
-                                
+                                    
                                     video_batch.append(video_data)
                                     if len(video_batch) >= batch_size:
                                         for v_data in video_batch:
@@ -268,9 +302,9 @@ async def ret_videos(account_id):
                                         insert_into_table(conn, "videos", v_data)
                                 conn.commit()
                     except Exception as e:
-                        print(f'Error: {e}')
-        finally:
-            pbar.close()
+                        log_event(f'Error: {e}', level='ERROR')
+            finally:
+                pbar.close()
 
 async def ret_masters(account_id):
     async with aiohttp.ClientSession() as session:
@@ -300,6 +334,7 @@ async def ret_masters(account_id):
             log_event("No tasks to process as all videos were skipped.", level="INFO")
             pbar.close()
             return
+
         try:
             with pbar:
                 for future in asyncio.as_completed(tasks):
@@ -348,16 +383,99 @@ async def update_master_info(session, db_lock, account_id, video_id):
                     ))
                     conn.commit()
         else:
-            # Skip non-JSON responses quietly
             pass
     except Exception as e:
         log_event(f'Error processing video ID {video_id}: {e}', level="ERROR")
+
+async def ret_renditions(account_id):
+    async with aiohttp.ClientSession() as session:
+        db_lock = asyncio.Lock()
+
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, delivery_type FROM videos WHERE account_id = ?", (account_id,))
+            video_data = cursor.fetchall()
+
+        total_videos = len(video_data)
+        pbar = progress_bar(total_videos, "Fetching renditions")
+        tasks = []
+
+        for video_id, delivery_type in video_data:
+            if delivery_type not in ['static_origin', 'dynamic_origin']:
+                log_event(f"Skipping video ID: {video_id} due to unsupported delivery type: {delivery_type}.", level="DEBUG")
+                pbar.update(1)
+                continue
+            tasks.append(update_rendition_info(session, db_lock, account_id, video_id))
+
+        if not tasks:
+            log_event(f"No tasks to process.", level="INFO")
+            pbar.close()
+            return
+
+        try:
+            with pbar:
+                for future in asyncio.as_completed(tasks):
+                    await future
+                    pbar.update(1)
+        finally:
+            pbar.close()
+
+async def update_rendition_info(session, db_lock, account_id, video_id):
+    try:
+        response = await api_request(session, account_id, 'dynamic_renditions', video_id)
+        if response:
+            async with db_lock:
+                with db_connection() as conn:
+                    cursor = conn.cursor()
+                    for rendition in response:
+                        rendition_data = {
+                            "video_id": video_id,
+                            "rendition_id": rendition.get('rendition_id'),
+                            "frame_height": rendition.get('frame_height'),
+                            "frame_width": rendition.get('frame_width'),
+                            "media_type": rendition.get('media_type'),
+                            "size": rendition.get('size'),
+                            "created_at": rendition.get('created_at'),
+                            "updated_at": rendition.get('updated_at'),
+                            "encoding_rate": rendition.get('encoding_rate'),
+                            "duration": rendition.get('duration'),
+                            "variant": rendition.get('variant'),
+                            "codec": rendition.get('codec'),
+                            "audio_configuration": rendition.get('audio_configuration'),
+                            "language": rendition.get('language'),
+                            "rendition_json": json.dumps(rendition) if rendition else None
+                        }
+                        cursor.execute("""
+                            INSERT INTO renditions (video_id, rendition_id, frame_height, frame_width, media_type, size, created_at, updated_at, encoding_rate, duration, variant, codec, audio_configuration, language, rendition_json)
+                            VALUES (:video_id, :rendition_id, :frame_height, :frame_width, :media_type, :size, :created_at, :updated_at, :encoding_rate, :duration, :variant, :codec, :audio_configuration, :language, :rendition_json)
+                            ON CONFLICT(video_id, rendition_id) DO UPDATE SET
+                                frame_height = excluded.frame_height,
+                                frame_width = excluded.frame_width,
+                                media_type = excluded.media_type,
+                                size = excluded.size,
+                                created_at = excluded.created_at,
+                                updated_at = excluded.updated_at,
+                                encoding_rate = excluded.encoding_rate,
+                                duration = excluded.duration,
+                                variant = excluded.variant,
+                                codec = excluded.codec,
+                                audio_configuration = excluded.audio_configuration,
+                                language = excluded.language,
+                                rendition_json = excluded.rendition_json
+                        """, rendition_data)
+                    conn.commit()
+        else:
+            log_event(f"No rendition info for video ID: {video_id}", level="INFO")
+    except Exception as e:
+        log_event(f"Error processing rendition for video ID {video_id}: {e}", level="ERROR")
 
 async def main():
     account_ids = [PUB_ID]
     for account_id in account_ids:
         await ret_videos(account_id)
         await ret_masters(account_id)
+        await ret_renditions(account_id)
+        # await build_csv(account_id)
 
 if __name__ == '__main__':
     asyncio.run(main())
