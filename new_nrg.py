@@ -1,4 +1,5 @@
 import os
+import csv
 import time
 from datetime import datetime
 import logging.config
@@ -31,6 +32,7 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 LOGS = os.getenv('LOG_PATH')
 DB_PATH = os.getenv('SQL_DB_PATH')
+CSV_PATH = os.getenv('CSV_PATH')
 BASE_URL = 'https://cms.api.brightcove.com/v1/accounts/{}'
 ENDPOINTS = {
     'video_count': '/counts/videos',
@@ -41,6 +43,12 @@ ENDPOINTS = {
 
 # Semaphore to control concurrency
 semaphore = asyncio.Semaphore(10)
+
+# Create the CSV for later
+csv_file = f'{datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}.csv'
+csv_dir = os.path.join(CSV_PATH, PUB_ID)
+os.makedirs(csv_dir, exist_ok=True)
+csv_path = os.path.join(csv_dir, csv_file)
 
 # Logging stuff
 log_file = f'{PUB_ID}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
@@ -152,7 +160,6 @@ def setup_database():
         for table, schema in TABLE_SCHEMAS.items():
             columns = ", ".join(f"{col} {dtype}" for col, dtype in schema["columns"].items())
             if table == "renditions":
-                # Special handling for renditions to add composite primary key
                 cursor.execute(f"""
                     CREATE TABLE IF NOT EXISTS {table} (
                         {columns},
@@ -468,6 +475,8 @@ async def update_rendition_info(session, db_lock, account_id, video_id):
             log_event(f"No rendition info for video ID: {video_id}", level="INFO")
     except Exception as e:
         log_event(f"Error processing rendition for video ID {video_id}: {e}", level="ERROR")
+
+# def build_csv():
 
 async def main():
     account_ids = [PUB_ID]
