@@ -235,40 +235,42 @@ async def ret_videos(account_id):
 
         batch_size = 200
         video_batch = []
-
-        with pbar:
-            for future in asyncio.as_completed(tasks):
-                response = await future
-                try:
-                    async with db_lock:
-                        with db_connection() as conn:
-                            for video in response:
-                                videos_processed += 1
-                                pbar.update(1)
-                                video_data = {
-                                    "id": video.get('id'),
-                                    "account_id": account_id,
-                                    "created_at": video.get('created_at'),
-                                    "updated_at": video.get('updated_at'),
-                                    "name": video.get('name'),
-                                    "duration": video.get('duration'),
-                                    "state": video.get('state'),
-                                    "delivery_type": video.get('delivery_type'),
-                                    "has_master": str(video.get('has_digital_master', False)),
-                                    "json_response": json.dumps(video)
-                                }
+        try:
+            with pbar:
+                for future in asyncio.as_completed(tasks):
+                    response = await future
+                    try:
+                        async with db_lock:
+                            with db_connection() as conn:
+                                for video in response:
+                                    videos_processed += 1
+                                    pbar.update(1)
+                                    video_data = {
+                                        "id": video.get('id'),
+                                        "account_id": account_id,
+                                        "created_at": video.get('created_at'),
+                                        "updated_at": video.get('updated_at'),
+                                        "name": video.get('name'),
+                                        "duration": video.get('duration'),
+                                        "state": video.get('state'),
+                                        "delivery_type": video.get('delivery_type'),
+                                        "has_master": str(video.get('has_digital_master', False)),
+                                        "json_response": json.dumps(video)
+                                    }
                                 
-                                video_batch.append(video_data)
-                                if len(video_batch) >= batch_size:
+                                    video_batch.append(video_data)
+                                    if len(video_batch) >= batch_size:
+                                        for v_data in video_batch:
+                                            insert_into_table(conn, "videos", v_data)
+                                        video_batch = []
+                                if video_batch:
                                     for v_data in video_batch:
                                         insert_into_table(conn, "videos", v_data)
-                                    video_batch = []
-                            if video_batch:
-                                for v_data in video_batch:
-                                    insert_into_table(conn, "videos", v_data)
-                            conn.commit()
-                except Exception as e:
-                    print(f'Error: {e}')
+                                conn.commit()
+                    except Exception as e:
+                        print(f'Error: {e}')
+        finally:
+            pbar.close()
 
 async def ret_masters(account_id):
     async with aiohttp.ClientSession() as session:
@@ -298,11 +300,13 @@ async def ret_masters(account_id):
             log_event("No tasks to process as all videos were skipped.", level="INFO")
             pbar.close()
             return
-
-        with pbar:
-            for future in asyncio.as_completed(tasks):
-                await future
-                pbar.update(1)
+        try:
+            with pbar:
+                for future in asyncio.as_completed(tasks):
+                    await future
+                    pbar.update(1)
+        finally:
+            pbar.close()
 
 async def update_master_info(session, db_lock, account_id, video_id):
     try:
