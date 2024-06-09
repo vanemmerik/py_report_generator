@@ -1,7 +1,7 @@
 import os
 import time
 from datetime import datetime
-import logging
+import logging.config
 import asyncio
 import aiohttp
 import ssl
@@ -39,16 +39,36 @@ ENDPOINTS = {
     'digital_master': '/videos/{}/digital_master'
 }
 
-# Logging stuff
+# Semaphore to control concurrency
+semaphore = asyncio.Semaphore(10)
 
+# Logging stuff
 log_file = f'{PUB_ID}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
 log_path = os.path.join(LOGS, log_file)
 os.makedirs(LOGS, exist_ok=True)
-logging.basicConfig(
-    filename = log_path,
-    level = logging.INFO,
-    format = '%(asctime)s - %(levelname)s - %(message)s'
-)
+logging_config = {
+    'version': 1,
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s - %(levelname)s - %(message)s'
+        },
+    },
+    'handlers': {
+        'file_handler': {
+            'class': 'logging.FileHandler',
+            'filename': log_path,
+            'mode': 'a',
+            'formatter': 'standard',
+            'level': 'DEBUG',
+        },
+    },
+    'root': {
+        'handlers': ['file_handler'],
+        'level': 'DEBUG',
+    },
+}
+
+logging.config.dictConfig(logging_config)
 
 def log_event(event_message, level='INFO'):
     if level == 'DEBUG':
@@ -109,8 +129,9 @@ def setup_database():
             for index in schema["indexes"]:
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_{index} ON {table}({index})")
         conn.commit()
-
-setup_database()  # Set up the database
+ 
+ # Set up the database
+setup_database() 
 
 # Global variable to store the token 
 token_info = {'token': None, 'expires_at': 0}
@@ -137,7 +158,6 @@ async def get_token():
                 token_data = await response.json()
                 token_info['token'] = token_data['access_token']
                 token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
-                # print("New token fetched")
             else:
                 raise Exception('Failed to get token: {}'.format(await response.text()))
 
@@ -153,13 +173,19 @@ async def api_request(session, account_id, endpoint_key, *args):
         headers = {
             'Authorization': f'Bearer {token}'
         }
+        f_args = ', '.join(map(str, args))
         async with session.get(url, headers=headers, ssl=ssl_context) as response:
             if response.status in range(200, 299):
                 try:
                     return await response.json()
                 except aiohttp.ContentTypeError:
-                    log_event(f'Non-JSON response for URL: {url}', level='ERROR')
+                    log_event(f'Non-JSON response for video ID: {f_args} – URL: {url}', level='ERROR')
                     return None
+            if response.status == 429:
+                        retry_after = response.headers.get('Retry-After', 1)
+                        log_event(f'Rate limit exceeded. Retrying after {retry_after} seconds', level='WARNING')
+                        await asyncio.sleep(int(retry_after))
+                        return await api_request(session, account_id, endpoint_key, *args)        
             else:
                 log_event(f'Request failed for URL: {url}, status: {response.status}', level='ERROR')
                 return None
@@ -207,7 +233,7 @@ async def ret_videos(account_id):
             insert_into_table(conn, "accounts", {"account_id": account_id})
             conn.commit()
 
-        batch_size = 5000  # Adjust batch size based on your requirements
+        batch_size = 200
         video_batch = []
 
         with pbar:
