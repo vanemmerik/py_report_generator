@@ -1,10 +1,12 @@
 import os
-import csv
+import pandas as pd
 import time
 from datetime import datetime
 import logging.config
 import asyncio
 import aiohttp
+import aiosqlite
+import aiofiles
 import ssl
 import certifi
 from dotenv import load_dotenv
@@ -27,6 +29,7 @@ ascii = "⣀⣄⣤⣦⣶⣷⣿"
 # ascii = "░▒▓█"
 
 # Get credentials from .env
+AC_NAME = os.getenv('AC_NAME')
 PUB_ID = os.getenv('PUB_ID')
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
@@ -45,13 +48,13 @@ ENDPOINTS = {
 semaphore = asyncio.Semaphore(10)
 
 # Create the CSV for later
-csv_file = f'{datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}.csv'
+csv_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H:%M:%S")}.csv'
 csv_dir = os.path.join(CSV_PATH, PUB_ID)
 os.makedirs(csv_dir, exist_ok=True)
 csv_path = os.path.join(csv_dir, csv_file)
 
 # Logging stuff
-log_file = f'{PUB_ID}_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+log_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H:%M:%S")}.log'
 log_path = os.path.join(LOGS, log_file)
 os.makedirs(LOGS, exist_ok=True)
 logging_config = {
@@ -181,7 +184,7 @@ token_info = {'token': None, 'expires_at': 0}
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 def progress_bar(total, desc):
-    bar_format = f"{Style.BRIGHT}{Fore.GREEN}{desc}{Style.RESET_ALL} |{Fore.RED}{{bar}}{Style.RESET_ALL}| {Style.BRIGHT}{{n_fmt}}/{{total_fmt}} [{Fore.CYAN}{{elapsed}}<{Fore.CYAN}{{remaining}}, {Fore.MAGENTA}{{rate_fmt}}{Style.RESET_ALL}]"
+    bar_format = f"{Style.BRIGHT}{Fore.MAGENTA}{AC_NAME}: {Fore.WHITE}{PUB_ID}: {Fore.GREEN}{desc}{Style.RESET_ALL} |{Fore.RED}{{bar}}{Style.RESET_ALL}| {Style.BRIGHT}{{n_fmt}}/{{total_fmt}} [{Fore.CYAN}{{elapsed}}<{Fore.CYAN}{{remaining}}, {Fore.MAGENTA}{{rate_fmt}}{Style.RESET_ALL}]"
     return tqdm(total=total, desc=desc, bar_format=bar_format, ascii=ascii, ncols=None)
 
 async def get_token():
@@ -267,7 +270,7 @@ async def ret_videos(account_id):
         tasks = [fetch_with_sem(session, account_id, 'video_info', limit, offset) for offset in range(0, iteration * limit, limit)]
         
         videos_processed = 0
-        pbar = progress_bar(total_videos, "Processing videos")
+        pbar = progress_bar(total_videos, "Processing video data")
         
         with db_connection() as conn:
             insert_into_table(conn, "accounts", {"account_id": account_id})
@@ -323,7 +326,7 @@ async def ret_masters(account_id):
             video_data = cursor.fetchall()
 
         total_videos = len(video_data)
-        pbar = progress_bar(total_videos, "Fetching master info")
+        pbar = progress_bar(total_videos, "Getting master data")
 
         tasks = []
         skipped_videos = 0
@@ -404,7 +407,7 @@ async def ret_renditions(account_id):
             video_data = cursor.fetchall()
 
         total_videos = len(video_data)
-        pbar = progress_bar(total_videos, "Fetching renditions")
+        pbar = progress_bar(total_videos, "Getting rendition data")
         tasks = []
 
         for video_id, delivery_type in video_data:
@@ -476,15 +479,38 @@ async def update_rendition_info(session, db_lock, account_id, video_id):
     except Exception as e:
         log_event(f"Error processing rendition for video ID {video_id}: {e}", level="ERROR")
 
-# def build_csv():
+async def build_main_csv(account_id):
+    if isinstance(account_id, str):
+        account_id = int(account_id)
+    
+    account_id_tuple = (account_id,)
+
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute('SELECT * FROM videos WHERE account_id = ?', account_id_tuple) as cursor:
+            rows = await cursor.fetchall()
+            columns = [description[0] for description in cursor.description]
+            data_frame = pd.DataFrame(rows, columns=columns)
+    
+    columns_to_ignore = ['json_response', 'master_json']
+    data_frame = data_frame.drop(columns=columns_to_ignore, errors='ignore')
+
+    total_rows = len(data_frame)
+    pbar = progress_bar(total=total_rows, desc="Writing to CSV")
+
+    async with aiofiles.open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
+        await csv_file.write(data_frame.to_csv(index=False, header=True))
+        for _ in range(total_rows):
+            pbar.update(1)
+
+    pbar.close()
 
 async def main():
     account_ids = [PUB_ID]
     for account_id in account_ids:
-        await ret_videos(account_id)
-        await ret_masters(account_id)
-        await ret_renditions(account_id)
-        # await build_csv(account_id)
+        # await ret_videos(account_id)
+        # await ret_masters(account_id)
+        # await ret_renditions(account_id)
+        await build_main_csv(account_id)
 
 if __name__ == '__main__':
     asyncio.run(main())
