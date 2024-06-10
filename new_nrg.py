@@ -507,9 +507,9 @@ async def build_main_csv(account_id):
 async def main():
     account_ids = [PUB_ID]
     for account_id in account_ids:
-        # await ret_videos(account_id)
-        # await ret_masters(account_id)
-        # await ret_renditions(account_id)
+        await ret_videos(account_id)
+        await ret_masters(account_id)
+        await ret_renditions(account_id)
         await build_main_csv(account_id)
 
 if __name__ == '__main__':
