@@ -201,38 +201,69 @@ async def get_token():
             if response.status == 200:
                 token_data = await response.json()
                 token_info['token'] = token_data['access_token']
-                token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
+                # token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
+                token_info['expires_at'] = time.time() + 10  # Simulate 30 seconds expiration time
+                print("New token fetched")
             else:
                 raise Exception('Failed to get token: {}'.format(await response.text()))
+
+async def get_token():
+    url = f'https://oauth.brightcove.com/v4/access_token'
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    data = {
+        'grant_type': 'client_credentials'
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, data=data, auth=aiohttp.BasicAuth(CLIENT_ID, CLIENT_SECRET), ssl=ssl_context) as response:
+            if response.status == 200:
+                token_data = await response.json()
+                token_info['token'] = token_data['access_token']
+                # token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
+                token_info['expires_at'] = time.time() + 10  # Simulate 10 seconds expiration time
+                print("New token fetched")
+            else:
+                raise Exception('Failed to get token: {}'.format(await response.text()))
+
+async def get_valid_token():
+    if time.time() >= token_info['expires_at'] - 5:  # Subtract 5 seconds as a buffer
+        await get_token()
+    return token_info['token']
 
 async def get_valid_token():
     if time.time() >= token_info['expires_at']:
         await get_token()
     return token_info['token']
 
-async def api_request(session, account_id, endpoint_key, *args):
+async def api_request(session, account_id, endpoint_key, *args, retry_count=3):
     try:
         url = BASE_URL.format(account_id) + ENDPOINTS[endpoint_key].format(*args)
         token = await get_valid_token()
         headers = {
             'Authorization': f'Bearer {token}'
         }
-        f_args = ', '.join(map(str, args))
-        async with session.get(url, headers=headers, ssl=ssl_context) as response:
-            if response.status in range(200, 299):
-                try:
-                    return await response.json()
-                except aiohttp.ContentTypeError:
-                    log_event(f'Non-JSON response for video ID: {f_args} - URL: {url}', level='ERROR')
+        async with semaphore:  # Use semaphore to limit concurrent requests
+            async with session.get(url, headers=headers, ssl=ssl_context) as response:
+                if response.status == 401 and retry_count > 0:
+                    log_event('Received 401, refreshing token and retrying...', level='WARNING')
+                    await get_token()
+                    return await api_request(session, account_id, endpoint_key, *args, retry_count=retry_count - 1)
+                elif response.status in range(200, 299):
+                    try:
+                        return await response.json()
+                    except aiohttp.ContentTypeError:
+                        log_event(f'Non-JSON response for URL: {url}', level='ERROR')
+                        return None
+                elif response.status == 429:
+                    retry_after = response.headers.get('Retry-After', 1)
+                    log_event(f'Rate limit exceeded. Retrying after {retry_after} seconds', level='WARNING')
+                    await asyncio.sleep(int(retry_after))
+                    return await api_request(session, account_id, endpoint_key, *args, retry_count=retry_count - 1)
+                else:
+                    log_event(f'Request failed for URL: {url}, status: {response.status}', level='ERROR')
                     return None
-            if response.status == 429:
-                        retry_after = response.headers.get('Retry-After', 1)
-                        log_event(f'Rate limit exceeded. Retrying after {retry_after} seconds', level='WARNING')
-                        await asyncio.sleep(int(retry_after))
-                        return await api_request(session, account_id, endpoint_key, *args)        
-            else:
-                log_event(f'Request failed for URL: {url}, status: {response.status}', level='ERROR')
-                return None
     except IndexError as e:
         log_event(f"Error formatting URL with args: {args}, Error: {e}", level="ERROR")
     except Exception as e:
@@ -276,7 +307,7 @@ async def ret_videos(account_id):
             insert_into_table(conn, "accounts", {"account_id": account_id})
             conn.commit()
     
-        batch_size = 200 # Batch size - writing blocks to DB
+        batch_size = 200  # Batch size for DB insertion
         video_batch = []
 
         with pbar:
@@ -286,6 +317,7 @@ async def ret_videos(account_id):
                     try:
                         async with db_lock:
                             with db_connection() as conn:
+                                cursor = conn.cursor()
                                 for video in response:
                                     videos_processed += 1
                                     pbar.update(1)
@@ -301,18 +333,22 @@ async def ret_videos(account_id):
                                         "has_master": str(video.get('has_digital_master', False)),
                                         "json_response": json.dumps(video)
                                     }
-                                    
                                     video_batch.append(video_data)
                                     if len(video_batch) >= batch_size:
-                                        for v_data in video_batch:
-                                            insert_into_table(conn, "videos", v_data)
-                                        video_batch = []
+                                        cursor.executemany("""
+                                            INSERT OR REPLACE INTO videos (id, account_id, created_at, updated_at, name, duration, state, delivery_type, has_master, json_response)
+                                            VALUES (:id, :account_id, :created_at, :updated_at, :name, :duration, :state, :delivery_type, :has_master, :json_response)
+                                        """, video_batch)
+                                        video_batch.clear()
                                 if video_batch:
-                                    for v_data in video_batch:
-                                        insert_into_table(conn, "videos", v_data)
+                                    cursor.executemany("""
+                                        INSERT OR REPLACE INTO videos (id, account_id, created_at, updated_at, name, duration, state, delivery_type, has_master, json_response)
+                                        VALUES (:id, :account_id, :created_at, :updated_at, :name, :duration, :state, :delivery_type, :has_master, :json_response)
+                                    """, video_batch)
+                                    video_batch.clear()
                                 conn.commit()
                     except Exception as e:
-                        log_event(f'Error: {e}', level='ERROR')
+                        log_event(f'Error processing response: {e}', level='ERROR')
             finally:
                 pbar.close()
 
