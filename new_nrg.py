@@ -199,7 +199,8 @@ async def get_token():
             if response.status == 200:
                 token_data = await response.json()
                 token_info['token'] = token_data['access_token']
-                token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
+                # token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
+                token_info['expires_at'] = time.time() + 30  # Simulate ## seconds expiration time
                 print("New token fetched")
             else:
                 raise Exception('Failed to get token: {}'.format(await response.text()))
