@@ -36,7 +36,6 @@ CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 LOGS = os.getenv('LOG_PATH')
 DB_PATH = os.getenv('SQL_DB_PATH')
 CSV_PATH = os.getenv('CSV_PATH')
-LAST_PROCESSED_FILE = os.path.join(os.getenv('LAST_PROCESSED_PATH'), f'{PUB_ID}_last_processed.txt')
 BASE_URL = 'https://cms.api.brightcove.com/v1/accounts/{}'
 ENDPOINTS = {
     'video_count': '/counts/videos',
@@ -95,21 +94,6 @@ def log_event(event_message, level='INFO'):
         logging.critical(event_message)
     else:
         logging.info(event_message)
-
-def write_last_processed(step, video_id=None):
-    with open(LAST_PROCESSED_FILE, 'w') as f:
-        f.write(f'{step}\n')
-        if video_id:
-            f.write(f'{video_id}\n')
-
-def read_last_processed():
-    if not os.path.exists(LAST_PROCESSED_FILE):
-        return None, None
-    with open(LAST_PROCESSED_FILE, 'r') as f:
-        lines = f.readlines()
-        step = lines[0].strip()
-        video_id = lines[1].strip() if len(lines) > 1 else None
-        return step, video_id
 
 # Metadata table schema
 TABLE_SCHEMAS = {
@@ -216,7 +200,7 @@ async def get_token():
                 token_data = await response.json()
                 token_info['token'] = token_data['access_token']
                 token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
-                # token_info['expires_at'] = time.time() + 30  # Simulate ## seconds expiration time
+                # token_info['expires_at'] = time.time() + 10  # Simulate ## seconds expiration time
                 # print("New token fetched")
             else:
                 raise Exception('Failed to get token: {}'.format(await response.text()))
@@ -530,23 +514,12 @@ async def build_main_csv(account_id):
     pbar.close()
 
 async def main():
-    step, last_video_id = read_last_processed()
-
-    if step is None or step == 'ret_videos':
-        await ret_videos(PUB_ID)
-        write_last_processed('ret_masters')
-
-    if step is None or step == 'ret_masters':
-        await ret_masters(PUB_ID)
-        write_last_processed('ret_renditions')
-
-    if step is None or step == 'ret_renditions':
-        await ret_renditions(PUB_ID)
-        write_last_processed('build_main_csv')
-
-    if step is None or step == 'build_main_csv':
-        await build_main_csv(PUB_ID)
-        write_last_processed('completed')
+    account_ids = [PUB_ID]
+    for account_id in account_ids:
+        await ret_videos(account_id)
+        await ret_masters(account_id)
+        await ret_renditions(account_id)
+        await build_main_csv(account_id)
 
 if __name__ == '__main__':
     asyncio.run(main())
