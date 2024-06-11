@@ -199,9 +199,9 @@ async def get_token():
             if response.status == 200:
                 token_data = await response.json()
                 token_info['token'] = token_data['access_token']
-                # token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
-                token_info['expires_at'] = time.time() + 30  # Simulate ## seconds expiration time
-                print("New token fetched")
+                token_info['expires_at'] = time.time() + token_data['expires_in'] - 10
+                # token_info['expires_at'] = time.time() + 30  # Simulate ## seconds expiration time
+                # print("New token fetched")
             else:
                 raise Exception('Failed to get token: {}'.format(await response.text()))
 
@@ -266,11 +266,11 @@ async def ret_videos(account_id):
         total_videos = count['count']
         iteration = (total_videos + limit - 1) // limit
 
-        async def fetch_with_sem(session, account_id, endpoint_key, *args):
+        async def fetch_video_info(session, account_id, endpoint_key, *args):
             async with semaphore:
                 return await api_request(session, account_id, endpoint_key, *args)
 
-        tasks = [fetch_with_sem(session, account_id, 'video_info', limit, offset) for offset in range(0, iteration * limit, limit)]
+        tasks = [fetch_video_info(session, account_id, 'video_info', limit, offset) for offset in range(0, iteration * limit, limit)]
         
         videos_processed = 0
         pbar = progress_bar(total_videos, "Processing video data")
@@ -330,18 +330,19 @@ async def ret_masters(account_id):
 
         total_videos = len(video_data)
         pbar = progress_bar(total_videos, "Getting master data")
-
         tasks = []
-        skipped_videos = 0
+
+        async def fetch_master_info(video_id):
+            async with semaphore:
+                return await update_master_info(session, db_lock, account_id, video_id)
 
         for video_id, has_master in video_data:
             if not has_master or has_master.lower() == 'false':
-                skipped_videos += 1
                 log_event(f"Skipping video ID: {video_id} because it has no master data.", level="DEBUG")
                 pbar.update(1)
                 continue
 
-            tasks.append(update_master_info(session, db_lock, account_id, video_id))
+            tasks.append(fetch_master_info(video_id))
 
         if not tasks:
             log_event("No tasks to process as all videos were skipped.", level="INFO")
@@ -413,12 +414,17 @@ async def ret_renditions(account_id):
         pbar = progress_bar(total_videos, "Getting rendition data")
         tasks = []
 
+        async def fetch_rendition_info(video_id):
+            async with semaphore:
+                return await update_rendition_info(session, db_lock, account_id, video_id)
+
         for video_id, delivery_type in video_data:
             if delivery_type not in ['static_origin', 'dynamic_origin']:
                 log_event(f"Skipping video ID: {video_id} due to unsupported delivery type: {delivery_type}.", level="DEBUG")
                 pbar.update(1)
                 continue
-            tasks.append(update_rendition_info(session, db_lock, account_id, video_id))
+
+            tasks.append(fetch_rendition_info(video_id))
 
         if not tasks:
             log_event(f"No tasks to process.", level="INFO")
