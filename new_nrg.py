@@ -48,7 +48,7 @@ ENDPOINTS = {
 semaphore = asyncio.Semaphore(10)
 
 # CSV for reference
-csv_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H%M%S")}.csv'
+csv_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H%M%S")}{"csv_name"}.csv'
 csv_dir = os.path.join(CSV_PATH, PUB_ID, f'{datetime.now().strftime("%Y.%m.%d_%H%M%S")}')
 os.makedirs(csv_dir, exist_ok=True)
 csv_path = os.path.join(csv_dir, csv_file)
@@ -129,6 +129,7 @@ TABLE_SCHEMAS = {
     "renditions": {
         "columns": {
             "video_id": "TEXT",
+            "account_id": "TEXT",
             "rendition_id": "TEXT",
             "frame_width": "INTEGER",
             "frame_height": "INTEGER",
@@ -449,6 +450,7 @@ async def update_rendition_info(session, db_lock, account_id, video_id):
                     for rendition in response:
                         rendition_data = {
                             "video_id": video_id,
+                            "account_id": account_id,
                             "rendition_id": rendition.get('rendition_id'),
                             "frame_height": rendition.get('frame_height'),
                             "frame_width": rendition.get('frame_width'),
@@ -465,8 +467,8 @@ async def update_rendition_info(session, db_lock, account_id, video_id):
                             "rendition_json": json.dumps(rendition) if rendition else None
                         }
                         cursor.execute("""
-                            INSERT INTO renditions (video_id, rendition_id, frame_height, frame_width, media_type, size, created_at, updated_at, encoding_rate, duration, variant, codec, audio_configuration, language, rendition_json)
-                            VALUES (:video_id, :rendition_id, :frame_height, :frame_width, :media_type, :size, :created_at, :updated_at, :encoding_rate, :duration, :variant, :codec, :audio_configuration, :language, :rendition_json)
+                            INSERT INTO renditions (video_id, account_id, rendition_id, frame_height, frame_width, media_type, size, created_at, updated_at, encoding_rate, duration, variant, codec, audio_configuration, language, rendition_json)
+                            VALUES (:video_id, :account_id, :rendition_id, :frame_height, :frame_width, :media_type, :size, :created_at, :updated_at, :encoding_rate, :duration, :variant, :codec, :audio_configuration, :language, :rendition_json)
                             ON CONFLICT(video_id, rendition_id) DO UPDATE SET
                                 frame_height = excluded.frame_height,
                                 frame_width = excluded.frame_width,
@@ -504,7 +506,32 @@ async def build_main_csv(account_id):
     data_frame = data_frame.drop(columns=columns_to_ignore, errors='ignore')
 
     total_rows = len(data_frame)
-    pbar = progress_bar(total=total_rows, desc="Writing to CSV")
+    pbar = progress_bar(total=total_rows, desc="Writing main CSV")
+
+    async with aiofiles.open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
+        await csv_file.write(data_frame.to_csv(index=False, header=True))
+        for _ in range(total_rows):
+            pbar.update(1)
+
+    pbar.close()
+
+async def build_renditions_csv(account_id):
+    if isinstance(account_id, str):
+        account_id = int(account_id)
+    
+    account_id_tuple = (account_id,)
+
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute('SELECT * FROM renditions WHERE account_id = ?', account_id_tuple) as cursor:
+            rows = await cursor.fetchall()
+            columns = [description[0] for description in cursor.description]
+            data_frame = pd.DataFrame(rows, columns=columns)
+    
+    columns_to_ignore = ['created_at', 'updated_at', 'rendition_json']
+    data_frame = data_frame.drop(columns=columns_to_ignore, errors='ignore')
+
+    total_rows = len(data_frame)
+    pbar = progress_bar(total=total_rows, desc="Writing renditions CSV")
 
     async with aiofiles.open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
         await csv_file.write(data_frame.to_csv(index=False, header=True))
@@ -520,6 +547,7 @@ async def main():
         await ret_masters(account_id)
         await ret_renditions(account_id)
         await build_main_csv(account_id)
+        await build_renditions_csv(account_id)
 
 if __name__ == '__main__':
     asyncio.run(main())
