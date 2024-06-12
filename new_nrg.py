@@ -44,12 +44,12 @@ ENDPOINTS = {
     'digital_master': '/videos/{}/digital_master'
 }
 
-# Semaphore to control concurrency
+# Semaphore to control concurrency default set to 10 RPS
 semaphore = asyncio.Semaphore(10)
 
-# Create the CSV for later
-csv_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H:%M:%S")}.csv'
-csv_dir = os.path.join(CSV_PATH, PUB_ID)
+# CSV for reference
+csv_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H%M%S")}.csv'
+csv_dir = os.path.join(CSV_PATH, PUB_ID, f'{datetime.now().strftime("%Y.%m.%d_%H%M%S")}')
 os.makedirs(csv_dir, exist_ok=True)
 csv_path = os.path.join(csv_dir, csv_file)
 
@@ -95,7 +95,7 @@ def log_event(event_message, level='INFO'):
     else:
         logging.info(event_message)
 
-# Metadata table schema
+# Table structure
 TABLE_SCHEMAS = {
     "accounts": {
         "columns": {
