@@ -512,6 +512,11 @@ async def build_main_csv(account_id):
             columns = [description[0] for description in cursor.description]
             data_frame = pd.DataFrame(rows, columns=columns)
 
+    integer_columns = ['duration', 'master_size', 'master_width', 'master_height', 'master_duration', 'master_encoding_rate']
+    for column in integer_columns:
+        if column in data_frame.columns:
+            data_frame[column] = pd.to_numeric(data_frame[column], downcast='integer', errors='coerce').fillna(0).astype(int)
+
     columns_to_ignore = ['json_response', 'master_json']
     data_frame = data_frame.drop(columns=columns_to_ignore, errors='ignore')
 
@@ -537,6 +542,11 @@ async def build_renditions_csv(account_id):
             columns = [description[0] for description in cursor.description]
             data_frame = pd.DataFrame(rows, columns=columns)
     
+    integer_columns = ['frame_width', 'frame_height', 'size', 'encoding_rate', 'duration']
+    for column in integer_columns:
+        if column in data_frame.columns:
+            data_frame[column] = pd.to_numeric(data_frame[column], downcast='integer', errors='coerce').fillna(0).astype(int)
+
     columns_to_ignore = ['created_at', 'updated_at', 'rendition_json']
     data_frame = data_frame.drop(columns=columns_to_ignore, errors='ignore')
 
