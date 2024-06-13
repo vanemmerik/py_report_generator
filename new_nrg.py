@@ -48,13 +48,22 @@ ENDPOINTS = {
 semaphore = asyncio.Semaphore(10)
 
 # CSV for reference
-csv_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H%M%S")}{"csv_name"}.csv'
-csv_dir = os.path.join(CSV_PATH, PUB_ID, f'{datetime.now().strftime("%Y.%m.%d_%H%M%S")}')
-os.makedirs(csv_dir, exist_ok=True)
-csv_path = os.path.join(csv_dir, csv_file)
+timestamp = datetime.now().strftime("%Y.%m.%d_%H%M%S")
+def csv_paths(csv_name):
+    csv_file = f'{PUB_ID}_{timestamp}_{csv_name}.csv'
+    csv_dir = os.path.join(CSV_PATH, PUB_ID, f'{timestamp}')
+    os.makedirs(csv_dir, exist_ok=True)
+    csv_path = os.path.join(csv_dir, csv_file)
+    return csv_path
+
+async def write_to_csv(csv_name, data_frame):
+
+    csv_path = csv_paths(csv_name)
+    async with aiofiles.open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
+        await csv_file.write(data_frame.to_csv(index=False, header=True))
 
 # Logging stuff
-log_file = f'{PUB_ID}_{datetime.now().strftime("%Y.%m.%d_%H:%M:%S")}.log'
+log_file = f'{PUB_ID}_{timestamp}.log'
 log_path = os.path.join(LOGS, log_file)
 os.makedirs(LOGS, exist_ok=True)
 logging_config = {
@@ -491,6 +500,7 @@ async def update_rendition_info(session, db_lock, account_id, video_id):
         log_event(f"Error processing rendition for video ID {video_id}: {e}", level="ERROR")
 
 async def build_main_csv(account_id):
+    csv_name = "master"
     if isinstance(account_id, str):
         account_id = int(account_id)
     
@@ -501,21 +511,21 @@ async def build_main_csv(account_id):
             rows = await cursor.fetchall()
             columns = [description[0] for description in cursor.description]
             data_frame = pd.DataFrame(rows, columns=columns)
-    
+
     columns_to_ignore = ['json_response', 'master_json']
     data_frame = data_frame.drop(columns=columns_to_ignore, errors='ignore')
 
     total_rows = len(data_frame)
     pbar = progress_bar(total=total_rows, desc="Writing main CSV")
 
-    async with aiofiles.open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
-        await csv_file.write(data_frame.to_csv(index=False, header=True))
-        for _ in range(total_rows):
-            pbar.update(1)
-
+    await write_to_csv(csv_name, data_frame)
+    for _ in range(total_rows):
+        pbar.update(1)
+    
     pbar.close()
 
 async def build_renditions_csv(account_id):
+    csv_name = "renditions"
     if isinstance(account_id, str):
         account_id = int(account_id)
     
@@ -533,10 +543,9 @@ async def build_renditions_csv(account_id):
     total_rows = len(data_frame)
     pbar = progress_bar(total=total_rows, desc="Writing renditions CSV")
 
-    async with aiofiles.open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
-        await csv_file.write(data_frame.to_csv(index=False, header=True))
-        for _ in range(total_rows):
-            pbar.update(1)
+    await write_to_csv(csv_name, data_frame)
+    for _ in range(total_rows):
+        pbar.update(1)
 
     pbar.close()
 
