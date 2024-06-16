@@ -223,7 +223,10 @@ async def get_valid_token():
     await token_event.wait()
     return token_info['token']
 
-async def api_request(session, account_id, endpoint_key, *args):
+async def api_request(session, account_id, endpoint_key, *args, retry_count=5):
+    retry_status_codes = {500, 502, 503, 504}
+    retry_wait = 3
+
     try:
         url = BASE_URL.format(account_id) + ENDPOINTS[endpoint_key].format(*args)
         token = await get_valid_token()
@@ -231,6 +234,7 @@ async def api_request(session, account_id, endpoint_key, *args):
             'Authorization': f'Bearer {token}'
         }
         f_args = ', '.join(map(str, args))
+
         async with session.get(url, headers=headers, ssl=ssl_context) as response:
             if response.status in range(200, 299):
                 try:
@@ -238,11 +242,17 @@ async def api_request(session, account_id, endpoint_key, *args):
                 except aiohttp.ContentTypeError:
                     log_event(f'Non-JSON response for video ID: {f_args} - URL: {url}', level='ERROR')
                     return None
-            if response.status == 429:
-                        retry_after = response.headers.get('Retry-After', 1)
-                        log_event(f'Rate limit exceeded. Retrying after {retry_after} seconds', level='WARNING')
-                        await asyncio.sleep(int(retry_after))
-                        return await api_request(session, account_id, endpoint_key, *args)        
+            elif response.status in retry_status_codes or response.status == 429:
+                if retry_count > 0:
+                    retry_after = retry_wait
+                    if response.status == 429:
+                        retry_after = int(response.headers.get('Retry-After', retry_wait))
+                    log_event(f'Status {response.status} for URL: {url}. Retrying in {retry_after} seconds...', level='WARNING')
+                    await asyncio.sleep(retry_after)
+                    return await api_request(session, account_id, endpoint_key, *args, retry_count=retry_count - 1)
+                else:
+                    log_event(f'Request failed after {5 - retry_count} retries for URL: {url}', level='ERROR')
+                    return None
             else:
                 log_event(f'Request failed for URL: {url}, status: {response.status}', level='ERROR')
                 return None
@@ -562,11 +572,22 @@ async def build_renditions_csv(account_id):
 async def main():
     account_ids = [PUB_ID]
     for account_id in account_ids:
-        await ret_videos(account_id)
-        await ret_masters(account_id)
-        await ret_renditions(account_id)
-        await build_main_csv(account_id)
-        await build_renditions_csv(account_id)
+        # Switching if you have alredy have the video information in the DB and just want the CSV created
+        while True:
+            response = input("Have you already stored the video data? (y/n): ").strip().lower()
+            if response == 'y':
+                await build_main_csv(account_id)
+                await build_renditions_csv(account_id)
+                break
+            elif response == 'n':
+                await ret_videos(account_id)
+                await ret_masters(account_id)
+                await ret_renditions(account_id)
+                await build_main_csv(account_id)
+                await build_renditions_csv(account_id)
+                break
+            else:
+                print("Invalid input, please enter 'y' for Yes or 'n' for No.")
 
 if __name__ == '__main__':
     asyncio.run(main())
