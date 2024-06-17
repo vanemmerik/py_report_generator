@@ -14,6 +14,10 @@ import json
 from tqdm.asyncio import tqdm
 from colorama import Fore, Style, init as colorama_init
 import sqlite3
+import subprocess
+
+# Run caffeinate process to prevent sleep - Mac only
+caffeinate = subprocess.Popen(['caffeinate', '-s'])
 
 # Initialise colorama
 colorama_init(autoreset=True)
@@ -574,7 +578,7 @@ async def main():
     for account_id in account_ids:
         # Switching if you have alredy have the video information in the DB and just want the CSV created
         while True:
-            response = input("Have you already stored the video data? (y/n): ").strip().lower()
+            response = input(f"Have you already stored the video data for {AC_NAME}? (y/n): ").strip().lower()
             if response == 'y':
                 await build_main_csv(account_id)
                 await build_renditions_csv(account_id)
@@ -585,6 +589,7 @@ async def main():
                 await ret_renditions(account_id)
                 await build_main_csv(account_id)
                 await build_renditions_csv(account_id)
+                caffeinate.terminate()
                 break
             else:
                 print("Invalid input, please enter 'y' for Yes or 'n' for No.")
