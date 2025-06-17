@@ -1,4 +1,5 @@
 import os
+import zipfile
 import pandas as pd
 import time
 from datetime import datetime
@@ -61,10 +62,20 @@ def csv_paths(csv_name):
     return csv_path
 
 async def write_to_csv(csv_name, data_frame):
-
     csv_path = csv_paths(csv_name)
     async with aiofiles.open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
         await csv_file.write(data_frame.to_csv(index=False, header=True))
+
+def zip_dir():
+    csv_dir = os.path.join(CSV_PATH, PUB_ID, f'{timestamp}')
+    zip_file = os.path.join(csv_dir, f'{PUB_ID}_{timestamp}.zip')
+
+    with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(csv_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, start=csv_dir)
+                zipf.write(file_path, arcname)
 
 # Logging stuff
 log_file = f'{PUB_ID}_{timestamp}.log'
@@ -582,6 +593,7 @@ async def main():
             if response == 'y':
                 await build_main_csv(account_id)
                 await build_renditions_csv(account_id)
+                zip_dir()
                 break
             elif response == 'n':
                 await ret_videos(account_id)
@@ -589,6 +601,7 @@ async def main():
                 await ret_renditions(account_id)
                 await build_main_csv(account_id)
                 await build_renditions_csv(account_id)
+                zip_dir()
                 caffeinate.terminate()
                 break
             else:
