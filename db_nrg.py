@@ -608,4 +608,7 @@ async def main():
                 print("Invalid input, please enter 'y' for Yes or 'n' for No.")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        caffeinate.terminate()
