@@ -68,12 +68,17 @@ async def write_to_csv(csv_name, data_frame):
 
 def zip_dir():
     csv_dir = os.path.join(CSV_PATH, PUB_ID, f'{timestamp}')
-    zip_file = os.path.join(csv_dir, f'{PUB_ID}_{timestamp}.zip')
+    zip_file = os.path.join(CSV_PATH, PUB_ID, f'{PUB_ID}_{timestamp}.zip')  # write outside csv_dir
 
     with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(csv_dir):
             for file in files:
                 file_path = os.path.join(root, file)
+
+                # extra safety: never add the zip file itself
+                if os.path.abspath(file_path) == os.path.abspath(zip_file):
+                    continue
+
                 arcname = os.path.relpath(file_path, start=csv_dir)
                 zipf.write(file_path, arcname)
 
