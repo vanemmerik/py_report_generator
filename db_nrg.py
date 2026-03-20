@@ -3,6 +3,7 @@ import zipfile
 import pandas as pd
 import time
 from datetime import datetime
+import logging
 import logging.config
 import asyncio
 import aiohttp
@@ -77,8 +78,11 @@ def zip_dir():
         for root, dirs, files in os.walk(csv_dir):
             for file in files:
                 file_path = os.path.join(root, file)
+
+                # Safety: never add the zip to itself
                 if os.path.abspath(file_path) == os.path.abspath(zip_file):
                     continue
+
                 arcname = os.path.relpath(file_path, start=csv_dir)
                 zipf.write(file_path, arcname)
 
@@ -148,6 +152,7 @@ TABLE_SCHEMAS = {
             "state": "TEXT",
             "delivery_type": "TEXT",
             "has_master": "TEXT",
+            "ingestion_profile_id": "TEXT",
             "json_response": "TEXT",
             "master_id": "TEXT",
             "master_size": "INTEGER",
@@ -179,6 +184,16 @@ TABLE_SCHEMAS = {
             "rendition_json": "TEXT"
         },
         "indexes": ["video_id", "rendition_id", "account_id"]
+    },
+    "ingestion_profiles": {
+        "columns": {
+            "video_id": "TEXT PRIMARY KEY",
+            "account_id": "TEXT",
+            "ingestion_profile_id": "TEXT",
+            "video_created_at": "TEXT",
+            "video_updated_at": "TEXT"
+        },
+        "indexes": ["video_id", "account_id", "ingestion_profile_id"]
     }
 }
 
@@ -198,6 +213,7 @@ def setup_database():
         cursor = conn.cursor()
         for table, schema in TABLE_SCHEMAS.items():
             columns = ", ".join(f"{col} {dtype}" for col, dtype in schema["columns"].items())
+
             if table == "renditions":
                 cursor.execute(f"""
                     CREATE TABLE IF NOT EXISTS {table} (
@@ -210,10 +226,54 @@ def setup_database():
 
             for index in schema["indexes"]:
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_{index} ON {table}({index})")
+
+        conn.commit()
+
+
+def table_exists(conn, table_name):
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,)
+    )
+    return cursor.fetchone() is not None
+
+
+def column_exists(conn, table_name, column_name):
+    cursor = conn.cursor()
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cursor.fetchall()]
+    return column_name in columns
+
+
+def ensure_schema_updates():
+    with db_connection() as conn:
+        cursor = conn.cursor()
+
+        if table_exists(conn, "videos") and not column_exists(conn, "videos", "ingestion_profile_id"):
+            cursor.execute("ALTER TABLE videos ADD COLUMN ingestion_profile_id TEXT")
+
+        if not table_exists(conn, "ingestion_profiles"):
+            cursor.execute("""
+                CREATE TABLE ingestion_profiles (
+                    video_id TEXT PRIMARY KEY,
+                    account_id TEXT,
+                    ingestion_profile_id TEXT,
+                    video_created_at TEXT,
+                    video_updated_at TEXT
+                )
+            """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_ingestion_profile_id ON videos(ingestion_profile_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingestion_profiles_video_id ON ingestion_profiles(video_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingestion_profiles_account_id ON ingestion_profiles(account_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingestion_profiles_ingestion_profile_id ON ingestion_profiles(ingestion_profile_id)")
+
         conn.commit()
 
 
 setup_database()
+ensure_schema_updates()
 
 # Store the token
 token_info = {'token': None, 'expires_at': 0}
@@ -325,6 +385,23 @@ def insert_into_table(conn, table_name, data):
         conn.execute(sql, values)
 
 
+def upsert_ingestion_profile(conn, account_id, video_id, ingestion_profile_id, created_at=None, updated_at=None):
+    if not ingestion_profile_id:
+        return
+
+    conn.execute("""
+        INSERT INTO ingestion_profiles (
+            video_id, account_id, ingestion_profile_id, video_created_at, video_updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(video_id) DO UPDATE SET
+            account_id = excluded.account_id,
+            ingestion_profile_id = excluded.ingestion_profile_id,
+            video_created_at = excluded.video_created_at,
+            video_updated_at = excluded.video_updated_at
+    """, (video_id, account_id, ingestion_profile_id, created_at, updated_at))
+
+
 def prompt_date_filter():
     while True:
         mode = input("Process entire library or a date range? (all/range): ").strip().lower()
@@ -375,9 +452,55 @@ def get_sql_date_clause(date_filter, table_alias=None):
 def clear_account_data(account_id):
     with db_connection() as conn:
         cursor = conn.cursor()
+        cursor.execute("DELETE FROM ingestion_profiles WHERE account_id = ?", (account_id,))
         cursor.execute("DELETE FROM renditions WHERE account_id = ?", (account_id,))
         cursor.execute("DELETE FROM videos WHERE account_id = ?", (account_id,))
         conn.commit()
+
+
+def backfill_ingestion_profile_ids(account_id):
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, created_at, updated_at, json_response, ingestion_profile_id
+            FROM videos
+            WHERE account_id = ?
+        """, (account_id,))
+        rows = cursor.fetchall()
+
+        updated_count = 0
+
+        for video_id, created_at, updated_at, json_response, existing_ingestion_profile_id in rows:
+            ingestion_profile_id = existing_ingestion_profile_id
+
+            if not ingestion_profile_id and json_response:
+                try:
+                    payload = json.loads(json_response)
+                    ingestion_profile_id = payload.get("ingestion_profile_id")
+                except Exception:
+                    ingestion_profile_id = None
+
+            if ingestion_profile_id:
+                cursor.execute("""
+                    UPDATE videos
+                    SET ingestion_profile_id = ?
+                    WHERE id = ?
+                """, (ingestion_profile_id, video_id))
+
+                upsert_ingestion_profile(
+                    conn,
+                    account_id,
+                    video_id,
+                    ingestion_profile_id,
+                    created_at,
+                    updated_at
+                )
+                updated_count += 1
+
+        conn.commit()
+
+        if updated_count:
+            log_event(f"Backfilled ingestion_profile_id for {updated_count} videos", level="INFO")
 
 
 async def ret_videos(account_id, date_filter=None):
@@ -431,6 +554,9 @@ async def ret_videos(account_id, date_filter=None):
                             with db_connection() as conn:
                                 for video in response:
                                     pbar.update(1)
+
+                                    ingestion_profile_id = video.get('ingestion_profile_id')
+
                                     video_data = {
                                         "id": video.get('id'),
                                         "account_id": account_id,
@@ -441,6 +567,7 @@ async def ret_videos(account_id, date_filter=None):
                                         "state": video.get('state'),
                                         "delivery_type": video.get('delivery_type'),
                                         "has_master": str(video.get('has_digital_master', False)),
+                                        "ingestion_profile_id": ingestion_profile_id,
                                         "json_response": json.dumps(video)
                                     }
 
@@ -449,11 +576,29 @@ async def ret_videos(account_id, date_filter=None):
                                     if len(video_batch) >= batch_size:
                                         for v_data in video_batch:
                                             insert_into_table(conn, "videos", v_data)
+
+                                            upsert_ingestion_profile(
+                                                conn,
+                                                v_data["account_id"],
+                                                v_data["id"],
+                                                v_data.get("ingestion_profile_id"),
+                                                v_data.get("created_at"),
+                                                v_data.get("updated_at")
+                                            )
                                         video_batch = []
 
                                 if video_batch:
                                     for v_data in video_batch:
                                         insert_into_table(conn, "videos", v_data)
+
+                                        upsert_ingestion_profile(
+                                            conn,
+                                            v_data["account_id"],
+                                            v_data["id"],
+                                            v_data.get("ingestion_profile_id"),
+                                            v_data.get("created_at"),
+                                            v_data.get("updated_at")
+                                        )
                                     video_batch = []
 
                                 conn.commit()
@@ -758,7 +903,10 @@ async def main():
             response = input(f"Have you already stored the video data for {AC_NAME}? (y/n): ").strip().lower()
 
             if response == 'y':
-                # Use existing DB content only, but filter CSV output by date range if requested
+                # Backfill ingestion_profile_id from stored json_response where possible
+                backfill_ingestion_profile_ids(account_id)
+
+                # Build CSVs from existing DB content only
                 await build_main_csv(account_id, date_filter)
                 await build_renditions_csv(account_id, date_filter)
                 zip_dir()
@@ -771,6 +919,9 @@ async def main():
                 await ret_videos(account_id, date_filter)
                 await ret_masters(account_id)
                 await ret_renditions(account_id)
+
+                # Safety backfill in case some existing rows were reused
+                backfill_ingestion_profile_ids(account_id)
 
                 await build_main_csv(account_id, date_filter)
                 await build_renditions_csv(account_id, date_filter)
